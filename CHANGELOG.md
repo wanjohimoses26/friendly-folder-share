@@ -31,3 +31,9 @@ All notable changes to Friendly Folder Share are documented here.
 ### Fixed
 
 - Accept GitHub’s official release-assets redirect host during verified updates.
+
+## [2.5.3] - 2026-11-18
+
+### Changed
+
+- Bumped the displayed application version for updater testing.
