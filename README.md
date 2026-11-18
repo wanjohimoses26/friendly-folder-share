@@ -1,58 +1,29 @@
-# Linux Community WhatsApp Bot ("Tux")
+# Friendly Folder Share
 
-A WhatsApp bot for the Linux community groups. It runs on Render, keeps its data in Supabase, and is managed from a simple admin web page plus a few WhatsApp commands.
+Friendly Folder Share is a single-file Python application that lets an owner share one selected folder over the same Wi‑Fi or through a temporary secure internet link. People sign in with the owner-provided password, choose a nickname, and can manage only the shared folder.
 
-## What works today
+## Run it
 
-| Feature | Status |
-|---|---|
-| Stays connected to WhatsApp, reconnects by itself | Working |
-| Admin web page (connect WhatsApp, assign groups, add AI keys) | Working |
-| `!ask`, `!start`, `!privacy`, `!help` | Working |
-| Admin commands: `!status`, `!setgroup`, `!pause`, `!resume` | Working |
-| Welcome messages for new members (`!welcome on/off`, `!setwelcome`) | Working |
-| Human-paced replies (typing indicator, short pauses, one message at a time) | Working |
-| Moderation (anti-link, flood, warnings) | Not built yet |
-| XP and ranks, daily questions, CTF, recaps | Not built yet |
+Download [`sharer.py`](sharer.py), then run `python3 sharer.py`. The app can install the per-user `sharer` launcher; after opening a new terminal, run `sharer`.
 
-The database tables for the not-built features already exist in `supabase/schema.sql`.
+The owner controls connected devices from the desktop Folder Share window. Connected web users do not receive the owner panel.
 
-## First-time setup (about 10 minutes)
+## How updates work
 
-All settings live in **Render, your service, Environment**. Nothing secret goes in GitHub.
+Stable updates are published as GitHub Releases. The app must use release assets, not the mutable `main` branch. Updates are checked over HTTPS, verified against the published SHA-256 file, compiled before installation, backed up, and installed atomically. The `sharer` command remains the same.
 
-1. Make sure these four are set (they should already be): `SUPABASE_URL`, `SUPABASE_API_KEY`, `SUPABASE_BOT_SECRET`, `AUTH_ENCRYPTION_KEY`. Also set `NODE_ENV` to `production`.
-2. Add **`ADMIN_PASSWORD`**: any passphrase of 8+ characters. This is your admin web page login.
-3. Add **`PAIR_TOKEN`**: any short secret word. You will use it once to make yourself a bot admin.
-4. Save. Render redeploys by itself.
-5. Open your service URL (`https://<your-service>.onrender.com`), click **Open admin panel**, and log in.
-6. If WhatsApp shows "not connected", click **Scan WhatsApp QR code** and scan it from the spare bot phone (Settings, Linked devices). This is only needed once.
-7. In the admin panel, copy the `!claim ...` message and send it to the bot in a private WhatsApp chat. You are now an admin.
-8. Add the bot number to your groups. In each group, send `!setgroup <role>` (for example `!setgroup cyber`). Roles: announcements, open_chat, cyber, help, distro, projects. You can also do this from the admin panel.
-9. Optional: paste an AI key (Groq, OpenRouter, Gemini) in the admin panel to switch on `!ask`.
+People using an older copy need to download the latest `sharer.py` once. After that, the built-in updater can manage later releases.
 
-## Everyday use
+## Security
 
-- `!status` shows whether the bot is healthy and which groups are set up.
-- `!pause` inside a group makes the bot silent there (`!resume` undoes it). `!pause all` in a private chat silences everything.
-- `!adminhelp` lists the admin commands. Normal members never see them.
+Share only a folder you are comfortable exposing. Use a unique strong password. Quick Tunnel links are temporary and can change each time sharing starts. Never commit passwords, session tokens, private keys, or personal files.
 
-## If something is wrong
+Anyone who controls this repository can publish code that users may run through the updater. Protect the GitHub account with 2FA, protect the `main` branch, review workflows, and use signed tags where possible. This application sends no telemetry.
 
-- **Bot does not answer:** check the admin panel for "Connected". If not, re-scan the QR code.
-- **Cannot log in:** check `ADMIN_PASSWORD` in Render. After changing it, wait for the redeploy.
-- **`!claim` says the code is invalid:** it must match `PAIR_TOKEN` exactly. The admin panel shows the current one.
-- **Render free plan sleeps** after 15 minutes without web traffic. Point a free uptime monitor (UptimeRobot, cron-job.org) at `/health` every 5 minutes.
+## Troubleshooting
 
-## For developers
+If `sharer` is unknown, open a new terminal after the launcher is installed. The desktop notification shows the exact launcher path. You can always run `python3 sharer.py` directly.
 
-```bash
-cp .env.example .env
-npm install
-npm test
-npm start
-```
+## License
 
-Optional: `node scripts/hash-pass.js "passphrase"` prints a hash you can use as `ADMIN_PASSWORD_HASH` instead of the plain password.
-
-WhatsApp login data is encrypted (AES-256-GCM) before it is stored in Supabase. Apply `supabase/schema.sql` to a new Supabase project before first run.
+MIT. See [LICENSE](LICENSE).
