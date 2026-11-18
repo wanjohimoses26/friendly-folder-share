@@ -76,7 +76,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 APP_TITLE = "Friendly Folder Share"
-APP_VERSION = "2.5.1"
+APP_VERSION = "2.5.2"
 GITHUB_OWNER = "wanjohimoses26"
 GITHUB_REPO = "friendly-folder-share"
 LAUNCH_COMMAND = "sharer"
@@ -124,11 +124,12 @@ def fetch_latest_release() -> dict | None:
 
 def _download_release_asset(url: str) -> bytes:
     parsed = urlparse(url)
-    if parsed.scheme != "https" or parsed.hostname not in {"github.com", "objects.githubusercontent.com"}:
+    approved_hosts = {"github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"}
+    if parsed.scheme != "https" or parsed.hostname not in approved_hosts:
         raise ValueError("The update source is not an approved GitHub download host.")
     with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "FriendlyFolderShare"}), timeout=30) as response:
         final_host = urlparse(response.geturl()).hostname
-        if final_host not in {"github.com", "objects.githubusercontent.com"}:
+        if final_host not in approved_hosts:
             raise ValueError("The update download was redirected to an unapproved host.")
         data = response.read(2 * 1024 * 1024 + 1)
         if len(data) > 2 * 1024 * 1024:

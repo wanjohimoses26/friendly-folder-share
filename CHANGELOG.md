@@ -25,3 +25,9 @@ All notable changes to Friendly Folder Share are documented here.
 - GitHub Releases update checking with ETag caching.
 - SHA-256, syntax, version, host, backup, and atomic-install checks for updates.
 - Non-blocking desktop update banner.
+
+## [2.5.2] - 2026-11-18
+
+### Fixed
+
+- Accept GitHub’s official release-assets redirect host during verified updates.
