@@ -27,6 +27,7 @@ import socketserver
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 
@@ -75,7 +76,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 APP_TITLE = "Friendly Folder Share"
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.5.1"
 GITHUB_OWNER = "wanjohimoses26"
 GITHUB_REPO = "friendly-folder-share"
 LAUNCH_COMMAND = "sharer"
@@ -91,6 +92,79 @@ LOG_PATH = CLOUDFLARED_DIR / "folder_share.log"
 VERSION_PATH = CLOUDFLARED_DIR / "app-version.txt"
 NOTICE_DISMISSED_PATH = CLOUDFLARED_DIR / "update-notice-dismissed.txt"
 COMMAND_NOTICE_DISMISSED_PATH = CLOUDFLARED_DIR / "command-notice-dismissed.txt"
+UPDATE_ETAG_PATH = CLOUDFLARED_DIR / "github-release-etag.txt"
+UPDATE_API_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+
+
+def version_tuple(value: str) -> tuple[int, ...]:
+    match = re.fullmatch(r"v?(\d+(?:\.\d+)*)", value.strip())
+    return tuple(int(part) for part in match.group(1).split(".")) if match else ()
+
+
+def fetch_latest_release() -> dict | None:
+    request = urllib.request.Request(UPDATE_API_URL, headers={"Accept": "application/vnd.github+json", "User-Agent": "FriendlyFolderShare"})
+    try:
+        if UPDATE_ETAG_PATH.exists():
+            request.add_header("If-None-Match", UPDATE_ETAG_PATH.read_text(encoding="utf-8").strip())
+        with urllib.request.urlopen(request, timeout=10) as response:
+            if response.headers.get("ETag"):
+                UPDATE_ETAG_PATH.parent.mkdir(parents=True, exist_ok=True)
+                UPDATE_ETAG_PATH.write_text(response.headers["ETag"], encoding="utf-8")
+            release = json.loads(response.read().decode("utf-8"))
+        tag = str(release.get("tag_name", ""))
+        if release.get("draft") or release.get("prerelease") or version_tuple(tag) <= version_tuple(APP_VERSION):
+            return None
+        assets = {item.get("name"): item.get("browser_download_url") for item in release.get("assets", [])}
+        if not assets.get("sharer.py") or not assets.get("sharer.py.sha256"):
+            return None
+        return {"tag": tag, "version": tag.lstrip("v"), "notes": str(release.get("body", "")), "source": assets["sharer.py"], "checksum": assets["sharer.py.sha256"]}
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def _download_release_asset(url: str) -> bytes:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in {"github.com", "objects.githubusercontent.com"}:
+        raise ValueError("The update source is not an approved GitHub download host.")
+    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "FriendlyFolderShare"}), timeout=30) as response:
+        final_host = urlparse(response.geturl()).hostname
+        if final_host not in {"github.com", "objects.githubusercontent.com"}:
+            raise ValueError("The update download was redirected to an unapproved host.")
+        data = response.read(2 * 1024 * 1024 + 1)
+        if len(data) > 2 * 1024 * 1024:
+            raise ValueError("The update file is unexpectedly large.")
+        return data
+
+
+def install_verified_update(release: dict, target: Path | None = None) -> Path:
+    source = _download_release_asset(release["source"])
+    checksum_text = _download_release_asset(release["checksum"]).decode("ascii", "strict")
+    expected = checksum_text.split()[0].lower()
+    actual = hashlib.sha256(source).hexdigest()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected) or not secrets.compare_digest(actual, expected):
+        raise ValueError("The downloaded update failed its SHA-256 integrity check.")
+    compile(source.decode("utf-8"), "sharer.py", "exec")
+    match = re.search(rb'^APP_VERSION\s*=\s*["\']([^"\']+)', source, re.M)
+    if not match or match.group(1).decode() != release["version"]:
+        raise ValueError("The downloaded file version does not match the release version.")
+    target = (target or Path(__file__)).resolve()
+    backup_dir = CLOUDFLARED_DIR / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        shutil.copy2(target, backup_dir / f"sharer-{APP_VERSION}.py")
+    with tempfile.NamedTemporaryFile("wb", dir=target.parent, prefix=".sharer-update-", delete=False) as output:
+        output.write(source)
+        temporary = Path(output.name)
+    try:
+        if target.exists():
+            temporary.chmod(target.stat().st_mode)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    backups = sorted(backup_dir.glob("sharer-*.py"), key=lambda item: item.stat().st_mtime, reverse=True)
+    for old in backups[3:]:
+        old.unlink(missing_ok=True)
+    return target
 
 
 def install_sharer_command() -> str:
@@ -1033,6 +1107,8 @@ class App:
         self.share_state: ShareState | None = None
         self.device_window = None
         self.device_tree = None
+        self.pending_release = None
+        self.update_banner = None
         self.folder: Path | None = None
         self.password = ""
         self.password_var = tk.StringVar()
@@ -1122,6 +1198,7 @@ class App:
         outer.pack(fill="both", expand=True)
         ttk.Label(outer, text=APP_TITLE, font=("TkDefaultFont", 21, "bold")).pack(anchor="w")
         ttk.Label(outer, text=f"Share one folder safely over the internet · version {APP_VERSION}", wraplength=600).pack(anchor="w", pady=(4, 18))
+        self.update_banner = ttk.Frame(outer, padding=10, relief="groove")
         self.choose_button = ttk.Button(outer, text="Choose folder…", command=self.choose_folder)
         self.choose_button.pack(anchor="w")
         self.folder_label = ttk.Label(outer, text="No folder selected", wraplength=540)
@@ -1152,6 +1229,47 @@ class App:
             self.window.after(350, self._show_version_notice)
         elif should_show_command_notice(self.command_path):
             self.window.after(350, self._show_command_notice)
+        self.window.after(1200, self.check_for_updates_async)
+
+    def check_for_updates_async(self):
+        threading.Thread(target=self._update_check_worker, daemon=True).start()
+
+    def _update_check_worker(self):
+        release = fetch_latest_release()
+        if release:
+            self.window.after(0, self._show_update_banner, release)
+
+    def _show_update_banner(self, release):
+        self.pending_release = release
+        if self.server:
+            self.status_var.set(f"Update {release['version']} is ready and will be available after sharing stops.")
+            return
+        if not self.update_banner or self.update_banner.winfo_ismapped():
+            return
+        for child in self.update_banner.winfo_children():
+            child.destroy()
+        ttk.Label(self.update_banner, text=f"A new version ({release['version']}) is available.", font=("TkDefaultFont", 11, "bold")).pack(side="left")
+        ttk.Label(self.update_banner, text="Review and install it when you are not sharing.", wraplength=280).pack(side="left", padx=12)
+        ttk.Button(self.update_banner, text="Update now", command=self.update_now).pack(side="right")
+        self.update_banner.pack(fill="x", pady=(0, 12), before=self.choose_button)
+
+    def update_now(self):
+        if not self.pending_release:
+            return
+        if self.server:
+            messagebox.showinfo("Sharing is active", "Stop sharing before installing an update. Your connected users will not be interrupted.")
+            return
+        if not messagebox.askyesno("Install update", f"Download and install Folder Share {self.pending_release['version']} now?"):
+            return
+        self.status_var.set("Downloading and checking the update…")
+        threading.Thread(target=self._update_install_worker, args=(self.pending_release,), daemon=True).start()
+
+    def _update_install_worker(self, release):
+        try:
+            install_verified_update(release)
+            self.window.after(0, lambda: (self.status_var.set(f"Updated to {release['version']}. Restarting…"), os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])))
+        except (OSError, ValueError, UnicodeError, SyntaxError) as exc:
+            self.window.after(0, lambda: messagebox.showerror("Update could not be installed", f"The update was not installed. Your current version is still safe.\n\nDetails: {exc}"))
 
     def _show_version_notice(self):
         notice = tk.Toplevel(self.window)

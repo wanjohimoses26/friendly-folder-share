@@ -17,3 +17,11 @@ All notable changes to Friendly Folder Share are documented here.
 - Connected web users cannot access the owner device-control panel.
 
 [Unreleased]: https://github.com/wanjohimoses26/friendly-folder-share/compare/v2.5.0...HEAD
+
+## [2.5.1] - 2026-11-18
+
+### Added
+
+- GitHub Releases update checking with ETag caching.
+- SHA-256, syntax, version, host, backup, and atomic-install checks for updates.
+- Non-blocking desktop update banner.
