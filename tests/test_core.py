@@ -236,5 +236,65 @@ class UpdaterTests(unittest.TestCase):
                     setattr(sharer, name, value)
 
 
+class FakeTree:
+    """Minimal stand-in for ttk.Treeview that, like the real one, drops the
+    selection of any row that is deleted."""
+    def __init__(self):
+        self.rows: dict[str, tuple] = {}
+        self.selected: set[str] = set()
+        self.deletions = 0
+
+    def get_children(self):
+        return tuple(self.rows)
+
+    def exists(self, iid):
+        return iid in self.rows
+
+    def item(self, iid, **options):
+        self.rows[iid] = tuple(options["values"])
+
+    def insert(self, parent, index, iid, values):
+        self.rows[iid] = tuple(values)
+
+    def delete(self, iid):
+        self.deletions += 1
+        self.rows.pop(iid, None)
+        self.selected.discard(iid)
+
+
+class DevicePanelTests(unittest.TestCase):
+    def test_refresh_keeps_selected_device_selected(self):
+        tree = FakeTree()
+        sharer.sync_tree_rows(tree, [("a", ("Ann", "Online")), ("b", ("Ben", "Online"))])
+        tree.selected = {"b"}
+        sharer.sync_tree_rows(tree, [("a", ("Ann", "Away")), ("b", ("Ben", "Online")), ("c", ("Cy", "Online"))])
+        self.assertEqual(tree.selected, {"b"})
+        self.assertEqual(tree.deletions, 0)
+        self.assertEqual(tree.rows["a"], ("Ann", "Away"))
+        self.assertEqual(list(tree.rows), ["a", "b", "c"])
+
+    def test_refresh_removes_only_disconnected_devices(self):
+        tree = FakeTree()
+        sharer.sync_tree_rows(tree, [("a", ("Ann",)), ("b", ("Ben",))])
+        tree.selected = {"a", "b"}
+        sharer.sync_tree_rows(tree, [("b", ("Ben",))])
+        self.assertEqual(list(tree.rows), ["b"])
+        self.assertEqual(tree.selected, {"b"})
+
+    def test_device_order_is_stable_when_last_seen_changes(self):
+        state = sharer.ShareState(Path(tempfile.gettempdir()), "correct horse battery")
+        first = state.new_session("1.1.1.1", "ua")
+        second = state.new_session("2.2.2.2", "ua")
+        self.assertTrue(state.set_nickname(first, "Ann")[0])
+        self.assertTrue(state.set_nickname(second, "Ben")[0])
+        before = [token for token, _ in state.devices()]
+        state.touch(first)
+        state.touch(second)
+        state.touch(first)
+        self.assertEqual([token for token, _ in state.devices()], before)
+        self.assertTrue(state.revoke_session(first))
+        self.assertEqual([token for token, _ in state.devices()], [second])
+
+
 if __name__ == "__main__":
     unittest.main()

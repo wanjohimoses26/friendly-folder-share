@@ -11,7 +11,6 @@ when the `cloudflared` program is installed. The public URL is HTTPS.
 
 from __future__ import annotations
 
-import base64
 import errno
 import hashlib
 import html
@@ -26,7 +25,6 @@ import secrets
 import shutil
 import socket
 import socketserver
-import string
 import subprocess
 import sys
 import tarfile
@@ -80,7 +78,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 APP_TITLE = "Friendly Folder Share"
-APP_VERSION = "2.6.4"
+APP_VERSION = "2.6.5"
 GITHUB_OWNER = "wanjohimoses26"
 GITHUB_REPO = "friendly-folder-share"
 LAUNCH_COMMAND = "sharer"
@@ -625,6 +623,21 @@ def _entry_info(root: Path, item: Path):
         return None
 
 
+def sync_tree_rows(tree, rows) -> None:
+    """Bring a ttk.Treeview up to date with rows = [(iid, values), ...] without
+    rebuilding it, so the owner's selection, focus and scroll position survive.
+    Existing rows keep their place; new rows are added at the end."""
+    wanted = {iid for iid, _ in rows}
+    for iid in list(tree.get_children()):
+        if iid not in wanted:
+            tree.delete(iid)
+    for iid, values in rows:
+        if tree.exists(iid):
+            tree.item(iid, values=values)
+        else:
+            tree.insert("", "end", iid=iid, values=values)
+
+
 class ShareState:
     def __init__(self, folder: Path, password: str):
         self.folder = folder.resolve()
@@ -748,7 +761,7 @@ class ShareState:
                     record = dict(item)
                     record["online"] = now - item["last_seen"] < 90
                     result.append((token, record))
-        return sorted(result, key=lambda pair: pair[1]["last_seen"], reverse=True)
+        return sorted(result, key=lambda pair: pair[1]["connected_at"])
 
     def revoke_session(self, token: str) -> bool:
         with self.lock:
@@ -1406,6 +1419,7 @@ class App:
         self.share_state: ShareState | None = None
         self.device_window = None
         self.device_tree = None
+        self.device_poll_job = None
         self.pending_release = None
         self.update_banner = None
         self.folder: Path | None = None
@@ -1489,7 +1503,7 @@ class App:
             SETUP_MARKER.write_text("Folder Share setup complete\n", encoding="utf-8")
             self.ui(self._setup_finished)
         except (OSError, urllib.error.URLError, RuntimeError, json.JSONDecodeError, tarfile.TarError) as exc:
-            self.ui(lambda: self._setup_error(str(exc)))
+            self.ui(self._setup_error, str(exc))
 
     def _setup_progress_update(self, text: str, fraction: float | None):
         self.setup_status.set(text)
@@ -1762,10 +1776,13 @@ class App:
             self.start_button.config(state="normal")
             self.status_var.set("Ready. Only this folder and its contents will be accessible.")
 
+    def _devices_panel_open(self) -> bool:
+        return bool(self.device_window and self.device_tree and self.device_window.winfo_exists())
+
     def show_devices(self):
         if not self.share_state:
             return
-        if self.device_window and self.device_window.winfo_exists():
+        if self._devices_panel_open():
             self.device_window.deiconify()
             self.device_window.lift()
             self.refresh_devices()
@@ -1774,46 +1791,82 @@ class App:
         window.title("Connected devices · Owner controls")
         window.geometry("720x360")
         window.transient(self.window)
+        window.protocol("WM_DELETE_WINDOW", self._close_devices)
         ttk.Label(window, text="Connected devices", font=("TkDefaultFont", 15, "bold")).pack(anchor="w", padx=16, pady=(14, 3))
-        ttk.Label(window, text="This panel is only on the owner’s computer. Disconnect ends a device’s Folder Share session.", wraplength=680).pack(anchor="w", padx=16, pady=(0, 10))
+        ttk.Label(window, text="This panel is only on the owner’s computer. Select a device, then press Disconnect to end its Folder Share session. Hold Ctrl or Shift to select several.", wraplength=680).pack(anchor="w", padx=16, pady=(0, 10))
         columns = ("nickname", "status", "connected", "last_seen", "address")
-        self.device_tree = ttk.Treeview(window, columns=columns, show="headings", height=9)
+        table = ttk.Frame(window)
+        table.pack(fill="both", expand=True, padx=16)
+        self.device_tree = ttk.Treeview(table, columns=columns, show="headings", height=9, selectmode="extended")
         headings = {"nickname":"Nickname", "status":"Status", "connected":"Connected", "last_seen":"Last seen", "address":"Network address"}
         widths = {"nickname":170, "status":90, "connected":150, "last_seen":150, "address":120}
         for column in columns:
             self.device_tree.heading(column, text=headings[column])
             self.device_tree.column(column, width=widths[column], anchor="w")
-        self.device_tree.pack(fill="both", expand=True, padx=16)
+        scrollbar = ttk.Scrollbar(table, orient="vertical", command=self.device_tree.yview)
+        self.device_tree.configure(yscrollcommand=scrollbar.set)
+        self.device_tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
         actions = ttk.Frame(window)
         actions.pack(fill="x", padx=16, pady=12)
         ttk.Button(actions, text="Disconnect selected", command=self.disconnect_selected).pack(side="left")
         ttk.Button(actions, text="Refresh", command=self.refresh_devices).pack(side="left", padx=(8, 0))
         self.refresh_devices()
 
+    def _close_devices(self):
+        if self.device_window:
+            try:
+                self.device_window.destroy()
+            except tk.TclError:
+                pass
+        self.device_window = None
+        self.device_tree = None
+
     def refresh_devices(self):
+        """Update the button count and, if open, the panel. Never rebuilds the table,
+        so a device the owner has selected stays selected."""
         if not self.share_state:
             return
         devices = self.share_state.devices()
         if hasattr(self, "devices_button"):
             self.devices_button.config(text=f"Connected devices ({len(devices)})")
-        if self.device_tree and self.device_tree.winfo_exists():
-            for item in self.device_tree.get_children():
-                self.device_tree.delete(item)
+        if self._devices_panel_open():
+            rows = []
             for token, device in devices:
                 connected = time.strftime("%Y-%m-%d %H:%M", time.localtime(device["connected_at"]))
                 last_seen = time.strftime("%H:%M:%S", time.localtime(device["last_seen"]))
                 status = "Online" if device["online"] else "Away"
-                self.device_tree.insert("", "end", iid=token, values=(device["nickname"], status, connected, last_seen, device["address"]))
-            self.window.after(2000, self.refresh_devices)
+                rows.append((token, (device["nickname"], status, connected, last_seen, device["address"])))
+            sync_tree_rows(self.device_tree, rows)
+
+    def _start_device_polling(self):
+        self._stop_device_polling()
+        self.device_poll_job = self.window.after(2000, self._device_poll)
+
+    def _stop_device_polling(self):
+        if self.device_poll_job is not None:
+            try:
+                self.window.after_cancel(self.device_poll_job)
+            except tk.TclError:
+                pass
+            self.device_poll_job = None
+
+    def _device_poll(self):
+        self.device_poll_job = None
+        if not self.share_state:
+            return
+        self.refresh_devices()
+        self.device_poll_job = self.window.after(2000, self._device_poll)
 
     def disconnect_selected(self):
-        if not self.share_state or not self.device_tree:
+        if not self.share_state or not self._devices_panel_open():
             return
         selected = self.device_tree.selection()
         if not selected:
-            messagebox.showinfo("Choose a device", "Select a connected device first.")
+            messagebox.showinfo("Choose a device", "Select a connected device first.", parent=self.device_window)
             return
-        self.share_state.revoke_session(selected[0])
+        for token in selected:
+            self.share_state.revoke_session(token)
         self.refresh_devices()
 
     def start(self):
@@ -1842,7 +1895,7 @@ class App:
             path = ensure_cloudflared(lambda text, fraction: self.ui(self.status_var.set, text))
             self.ui(lambda: self._start_server(path))
         except (OSError, urllib.error.URLError, RuntimeError, json.JSONDecodeError, tarfile.TarError) as exc:
-            self.ui(lambda: self._setup_failed(str(exc)))
+            self.ui(self._setup_failed, str(exc))
 
     def _setup_failed(self, details: str):
         self.progress.stop()
@@ -1863,8 +1916,13 @@ class App:
             self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
             self.thread.start()
         except OSError as exc:
-            messagebox.showerror("Could not start", f"The server could not start.\n\n{exc}")
             self.server = None
+            self.share_state = None
+            self.progress.stop()
+            self.choose_button.config(state="normal")
+            self.start_button.config(state="normal" if self.folder else "disabled")
+            self.status_var.set("Sharing could not start. Nothing is being shared.")
+            messagebox.showerror("Could not start", f"The server could not start.\n\n{exc}")
             return
         port = self.server.server_address[1]
         lan_url = f"http://{local_ip()}:{port}/"
@@ -1886,6 +1944,7 @@ class App:
         self.stop_button.config(state="normal")
         self.devices_button.config(state="normal")
         self.refresh_devices()
+        self._start_device_polling()
 
     def stop(self):
         self.tunnel_generation += 1  # cancels pending reconnects and timeouts
@@ -1904,12 +1963,10 @@ class App:
             self.server.server_close()
             self.server = None
         self.share_state = None
+        self._stop_device_polling()
         if hasattr(self, "devices_button"):
             self.devices_button.config(state="disabled", text="Connected devices (0)")
-        if self.device_window and self.device_window.winfo_exists():
-            self.device_window.destroy()
-            self.device_window = None
-            self.device_tree = None
+        self._close_devices()
         self.url_var.set("Server is stopped")
         self.local_url_var.set("")
         self.public_url = ""

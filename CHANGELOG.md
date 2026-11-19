@@ -7,6 +7,18 @@ app show a stronger "please update" message (those lines are hidden from the not
 
 ## [Unreleased]
 
+## [2.6.5] - 2026-11-19
+
+### Fixed
+- Connected devices panel: a selected device no longer deselects itself. The list now updates in place every 2 seconds instead of being rebuilt, rows keep a steady order, and you can select several devices (Ctrl/Shift) and disconnect them together.
+- Connected devices panel: pressing Refresh or reopening the panel no longer starts extra background refresh loops, and the "Connected devices (N)" count on the main window now stays current even when the panel is closed.
+- Connected devices panel: closing it with the window's X button is handled cleanly; a scrollbar was added for long lists.
+- A failed one-time setup or failed internet-link preparation now shows its error message and re-enables the buttons instead of leaving the app stuck on "Starting setup…" or a spinning progress bar.
+- If the sharing server cannot start (for example the port is blocked), the window is reset so you can try again.
+
+### Changed
+- Removed unused code and updated the release notes in the README to match the tests that actually run (Python 3.10 and 3.12).
+
 ## [2.6.4] - 2026-11-19
 
 ### Fixed

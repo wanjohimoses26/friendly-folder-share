@@ -35,7 +35,7 @@ Updates come from GitHub Releases only. The app checks at start and every 6 hour
 
 ## For the owner: releasing
 
-Write notes under `## [Unreleased]` in `CHANGELOG.md`, then run `./release.sh 2.6.0` (Windows: `release.bat 2.6.0`). It bumps `APP_VERSION`, runs the tests, commits, tags and pushes; GitHub Actions tests on Python 3.9 and 3.12 and publishes the release. Put `min_version: X.Y.Z` or `critical: true` on its own line in the notes to force a stronger update prompt.
+Write notes under `## [Unreleased]` in `CHANGELOG.md`, then run `./release.sh 2.6.0` (Windows: `release.bat 2.6.0`). It bumps `APP_VERSION`, runs the tests, commits, tags and pushes; GitHub Actions tests on Python 3.10 and 3.12 and publishes the release. Put `min_version: X.Y.Z` or `critical: true` on its own line in the notes to force a stronger update prompt.
 
 **Anyone who controls this repository controls what runs on every user's computer.** Turn on 2FA, protect `main` (no force-push or deletion), sign tags if you can, review workflow changes, and never commit passwords or tokens.
 
