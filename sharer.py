@@ -80,7 +80,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 APP_TITLE = "Friendly Folder Share"
-APP_VERSION = "2.6.0"
+APP_VERSION = "2.6.1"
 GITHUB_OWNER = "wanjohimoses26"
 GITHUB_REPO = "friendly-folder-share"
 LAUNCH_COMMAND = "sharer"
