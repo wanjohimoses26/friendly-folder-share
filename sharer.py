@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Secure, user-friendly folder sharing over a local network or the internet.
 
-Run with: python3 sharerv2.py
+Run with: python3 sharer.py
 
 The program opens a GUI where you choose a folder, then starts a password-
 protected web server. Anyone with the displayed URL and password can manage
@@ -12,6 +12,7 @@ when the `cloudflared` program is installed. The public URL is HTTPS.
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import html
 import http.server
@@ -19,17 +20,20 @@ import ipaddress
 import json
 import os
 import platform
+import queue
 import re
 import secrets
 import shutil
 import socket
 import socketserver
+import string
 import subprocess
 import sys
 import tarfile
 import tempfile
 import threading
 import time
+import traceback
 
 
 def bootstrap_tkinter():
@@ -85,6 +89,10 @@ SESSION_SECONDS = 8 * 60 * 60
 MIN_PASSWORD_LENGTH = 12
 LOGIN_WINDOW_SECONDS = 15 * 60
 LOGIN_MAX_FAILURES = 8
+PBKDF2_ITERATIONS = 240_000
+MIN_FREE_BYTES = 64 * 1024 * 1024  # keep some disk space free for the owner
+RESERVED_NAMES = {".folder_share_uploads", ".folder_share_trash"}
+WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 UPLOAD_PART_MAX_AGE = 24 * 60 * 60
 CLOUDFLARED_DIR = Path.home() / ".friendly_folder_share"
 SETUP_MARKER = CLOUDFLARED_DIR / ".setup_complete"
@@ -92,8 +100,13 @@ LOG_PATH = CLOUDFLARED_DIR / "folder_share.log"
 VERSION_PATH = CLOUDFLARED_DIR / "app-version.txt"
 NOTICE_DISMISSED_PATH = CLOUDFLARED_DIR / "update-notice-dismissed.txt"
 COMMAND_NOTICE_DISMISSED_PATH = CLOUDFLARED_DIR / "command-notice-dismissed.txt"
-UPDATE_ETAG_PATH = CLOUDFLARED_DIR / "github-release-etag.txt"
 UPDATE_API_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+UPDATE_CACHE_PATH = CLOUDFLARED_DIR / "github-release-cache.json"
+UPDATE_SKIPPED_PATH = CLOUDFLARED_DIR / "update-skipped.txt"
+PENDING_UPDATE_PATH = CLOUDFLARED_DIR / "pending-update.json"
+ROLLBACK_NOTICE_PATH = CLOUDFLARED_DIR / "rollback-notice.txt"
+BACKUP_DIR = CLOUDFLARED_DIR / "backups"
+MAX_UPDATE_BYTES = 2 * 1024 * 1024
 
 
 def version_tuple(value: str) -> tuple[int, ...]:
@@ -101,25 +114,48 @@ def version_tuple(value: str) -> tuple[int, ...]:
     return tuple(int(part) for part in match.group(1).split(".")) if match else ()
 
 
-def fetch_latest_release() -> dict | None:
-    request = urllib.request.Request(UPDATE_API_URL, headers={"Accept": "application/vnd.github+json", "User-Agent": "FriendlyFolderShare"})
-    try:
-        if UPDATE_ETAG_PATH.exists():
-            request.add_header("If-None-Match", UPDATE_ETAG_PATH.read_text(encoding="utf-8").strip())
-        with urllib.request.urlopen(request, timeout=10) as response:
-            if response.headers.get("ETag"):
-                UPDATE_ETAG_PATH.parent.mkdir(parents=True, exist_ok=True)
-                UPDATE_ETAG_PATH.write_text(response.headers["ETag"], encoding="utf-8")
-            release = json.loads(response.read().decode("utf-8"))
-        tag = str(release.get("tag_name", ""))
-        if release.get("draft") or release.get("prerelease") or version_tuple(tag) <= version_tuple(APP_VERSION):
-            return None
-        assets = {item.get("name"): item.get("browser_download_url") for item in release.get("assets", [])}
-        if not assets.get("sharer.py") or not assets.get("sharer.py.sha256"):
-            return None
-        return {"tag": tag, "version": tag.lstrip("v"), "notes": str(release.get("body", "")), "source": assets["sharer.py"], "checksum": assets["sharer.py.sha256"]}
-    except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError):
+def parse_release(release: dict) -> dict | None:
+    """Usable newer *stable* release -> what the updater needs, else None."""
+    tag = str(release.get("tag_name", ""))
+    if release.get("draft") or release.get("prerelease") or version_tuple(tag) <= version_tuple(APP_VERSION):
         return None
+    assets = {item.get("name"): item.get("browser_download_url") for item in release.get("assets", [])}
+    if not assets.get("sharer.py") or not assets.get("sharer.py.sha256"):
+        return None
+    notes = str(release.get("body") or "")
+    minimum = re.search(r"(?mi)^\s*min_version:\s*v?(\d+(?:\.\d+)*)\s*$", notes)
+    critical = bool(re.search(r"(?mi)^\s*critical:\s*true\s*$", notes))
+    shown = re.sub(r"(?mi)^\s*(?:min_version|critical):.*$\n?", "", notes).strip()
+    return {"tag": tag, "version": tag.lstrip("v"), "notes": shown, "source": assets["sharer.py"], "checksum": assets["sharer.py.sha256"], "min_version": minimum.group(1) if minimum else "", "critical": critical}
+
+
+def fetch_latest_release() -> dict | None:
+    """Ask GitHub for a newer stable release. Silent on any failure (offline etc.).
+    Uses an ETag, and keeps a cached copy of the release so a 304 'not modified'
+    still reports an update the person has not installed yet."""
+    try:
+        cache = json.loads(UPDATE_CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cache = {}
+    request = urllib.request.Request(UPDATE_API_URL, headers={"Accept": "application/vnd.github+json", "User-Agent": "FriendlyFolderShare"})
+    if cache.get("etag") and isinstance(cache.get("release"), dict):
+        request.add_header("If-None-Match", cache["etag"])
+    release = None
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            release = json.loads(response.read().decode("utf-8"))
+            etag = response.headers.get("ETag")
+            if etag:
+                UPDATE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                UPDATE_CACHE_PATH.write_text(json.dumps({"etag": etag, "release": release}), encoding="utf-8")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304 and isinstance(cache.get("release"), dict):
+            release = cache["release"]
+        else:
+            return None
+    except (OSError, urllib.error.URLError, ValueError):
+        return None
+    return parse_release(release) if isinstance(release, dict) else None
 
 
 def _download_release_asset(url: str) -> bytes:
@@ -137,22 +173,38 @@ def _download_release_asset(url: str) -> bytes:
         return data
 
 
-def install_verified_update(release: dict, target: Path | None = None) -> Path:
+def verify_update_payload(source: bytes, checksum_text: str, expected_version: str) -> None:
+    """Raise ValueError unless the file is genuine, sane and the expected version.
+    The code is compiled to check it is valid Python, but it is never executed."""
+    if len(source) > MAX_UPDATE_BYTES:
+        raise ValueError("The update file is unexpectedly large.")
+    parts = checksum_text.split()
+    expected = parts[0].lower() if parts else ""
+    if not re.fullmatch(r"[0-9a-f]{64}", expected) or not secrets.compare_digest(hashlib.sha256(source).hexdigest(), expected):
+        raise ValueError("The downloaded update failed its SHA-256 integrity check.")
+    try:
+        compile(source.decode("utf-8"), "sharer.py", "exec")
+    except (SyntaxError, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("The downloaded update is not a valid program.") from exc
+    match = re.search(rb'^APP_VERSION\s*=\s*["\']([^"\']+)', source, re.M)
+    if not match or match.group(1).decode() != expected_version:
+        raise ValueError("The downloaded file version does not match the release version.")
+
+
+def install_verified_update(release: dict, target: Path | None = None, progress=None) -> Path:
+    def step(text: str) -> None:
+        if progress:
+            progress(text)
+    step("Step 1 of 4: Downloading the update…")
     source = _download_release_asset(release["source"])
     checksum_text = _download_release_asset(release["checksum"]).decode("ascii", "strict")
-    expected = checksum_text.split()[0].lower()
-    actual = hashlib.sha256(source).hexdigest()
-    if not re.fullmatch(r"[0-9a-f]{64}", expected) or not secrets.compare_digest(actual, expected):
-        raise ValueError("The downloaded update failed its SHA-256 integrity check.")
-    compile(source.decode("utf-8"), "sharer.py", "exec")
-    match = re.search(rb'^APP_VERSION\s*=\s*["\']([^"\']+)', source, re.M)
-    if not match or match.group(1).decode() != release["version"]:
-        raise ValueError("The downloaded file version does not match the release version.")
+    step("Step 2 of 4: Checking it is genuine…")
+    verify_update_payload(source, checksum_text, release["version"])
+    step("Step 3 of 4: Installing…")
     target = (target or Path(__file__)).resolve()
-    backup_dir = CLOUDFLARED_DIR / "backups"
-    backup_dir.mkdir(parents=True, exist_ok=True)
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     if target.exists():
-        shutil.copy2(target, backup_dir / f"sharer-{APP_VERSION}.py")
+        shutil.copy2(target, BACKUP_DIR / f"sharer-{APP_VERSION}.py")
     with tempfile.NamedTemporaryFile("wb", dir=target.parent, prefix=".sharer-update-", delete=False) as output:
         output.write(source)
         temporary = Path(output.name)
@@ -162,10 +214,97 @@ def install_verified_update(release: dict, target: Path | None = None) -> Path:
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
-    backups = sorted(backup_dir.glob("sharer-*.py"), key=lambda item: item.stat().st_mtime, reverse=True)
+    backups = sorted(BACKUP_DIR.glob("sharer-*.py"), key=lambda item: item.stat().st_mtime, reverse=True)
     for old in backups[3:]:
         old.unlink(missing_ok=True)
     return target
+
+
+def _rollback_update(old_version: str, target: Path | None = None) -> str | None:
+    """Put the previous version back. Returns it, or None if that was impossible."""
+    target = (target or Path(__file__)).resolve()
+    try:
+        data = (BACKUP_DIR / f"sharer-{old_version}.py").read_bytes()
+        compile(data.decode("utf-8"), "sharer.py", "exec")
+        with tempfile.NamedTemporaryFile("wb", dir=target.parent, prefix=".sharer-rollback-", delete=False) as output:
+            output.write(data)
+            temporary = Path(output.name)
+        try:
+            temporary.chmod(target.stat().st_mode)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        VERSION_PATH.write_text(old_version + "\n", encoding="utf-8")
+        ROLLBACK_NOTICE_PATH.write_text(f"{APP_VERSION}\n{old_version}\n", encoding="utf-8")
+        with LOG_PATH.open("a", encoding="utf-8") as log:
+            log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} Version {APP_VERSION} did not start properly; restored {old_version}.\n")
+        PENDING_UPDATE_PATH.unlink(missing_ok=True)
+        return old_version
+    except (OSError, ValueError, SyntaxError):
+        try:
+            PENDING_UPDATE_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+
+def startup_update_guard(target: Path | None = None) -> str | None:
+    """Call once at launch (never on import). The first launch after an update
+    leaves a marker; the app clears it once its window is up. If the marker is
+    still there next time, the new version crashed, so the old one is restored."""
+    try:
+        previous = VERSION_PATH.read_text(encoding="utf-8").strip() if VERSION_PATH.exists() else ""
+        marker = json.loads(PENDING_UPDATE_PATH.read_text(encoding="utf-8")) if PENDING_UPDATE_PATH.exists() else None
+    except (OSError, ValueError):
+        return None
+    if isinstance(marker, dict) and marker.get("to") == APP_VERSION and marker.get("from"):
+        return _rollback_update(str(marker["from"]), target)
+    if previous and previous != APP_VERSION and version_tuple(APP_VERSION) > version_tuple(previous):
+        try:
+            PENDING_UPDATE_PATH.write_text(json.dumps({"from": previous, "to": APP_VERSION}), encoding="utf-8")
+        except OSError:
+            pass
+    return None
+
+
+def confirm_update_started() -> None:
+    try:
+        PENDING_UPDATE_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def restart_app() -> None:
+    command = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
+    if os.name == "nt":
+        subprocess.Popen(command, creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP, close_fds=True)
+        os._exit(0)
+    os.execv(sys.executable, command)
+
+
+def launcher_paths() -> list[Path]:
+    if os.name == "nt":
+        return [Path.home() / "bin" / f"{LAUNCH_COMMAND}.cmd"]
+    return [Path.home() / ".local" / "bin" / LAUNCH_COMMAND, Path.home() / "bin" / LAUNCH_COMMAND]
+
+
+def launcher_installed() -> bool:
+    return any(path.exists() for path in launcher_paths())
+
+
+def uninstall_sharer_command() -> None:
+    """Remove the launcher and the PATH lines this app added to shell startup files."""
+    for path in launcher_paths():
+        path.unlink(missing_ok=True)
+    if os.name != "nt":
+        for startup in (Path.home() / ".profile", Path.home() / ".bashrc", Path.home() / ".zshrc", Path.home() / ".config" / "fish" / "config.fish"):
+            try:
+                text = startup.read_text(encoding="utf-8")
+                cleaned = re.sub(r"\n*# Folder Share launcher\n[^\n]*\n", "\n", text)
+                if cleaned != text:
+                    startup.write_text(cleaned, encoding="utf-8")
+            except OSError:
+                pass
 
 
 def install_sharer_command() -> str:
@@ -232,8 +371,9 @@ def should_show_update_notice(previous_version: str | None) -> bool:
 
 
 def should_show_command_notice(command_path: str) -> bool:
-    token = f"{APP_VERSION}|{Path(__file__).resolve()}"
-    return bool(command_path) and not (COMMAND_NOTICE_DISMISSED_PATH.exists() and COMMAND_NOTICE_DISMISSED_PATH.read_text(encoding="utf-8").strip() == token)
+    token = str(Path(__file__).resolve())
+    declined = COMMAND_NOTICE_DISMISSED_PATH.exists() and COMMAND_NOTICE_DISMISSED_PATH.read_text(encoding="utf-8").strip() == token
+    return bool(command_path) and not launcher_installed() and not declined
 
 
 def detach_from_terminal() -> None:
@@ -351,14 +491,11 @@ def ensure_cloudflared(status_callback=None) -> str:
 
 
 def make_qr_image(data: str, destination: Path, status_callback=None) -> Path:
-    """Create a QR image, installing the small QR dependency if needed."""
+    """Create a QR image. Needs the optional 'qrcode' package (never installed silently)."""
     try:
         import qrcode
     except ImportError:
-        if status_callback:
-            status_callback("Installing QR-code support (one-time setup)…")
-        subprocess.run([sys.executable, "-m", "pip", "install", "--user", "qrcode[pil]"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=180)
-        import qrcode
+        raise RuntimeError("QR codes need the optional 'qrcode' package, which is not installed.\n\nTo enable it, run:\n    python3 -m pip install \"qrcode[pil]\"\nthen restart Folder Share. You can always just copy the link instead.")
     destination.parent.mkdir(parents=True, exist_ok=True)
     qrcode.make(data).save(destination)
     return destination
@@ -396,10 +533,104 @@ def format_size(size: int) -> str:
     return str(size)
 
 
+def validate_name(name: str) -> str:
+    """Validate a file/folder name typed by a person (rename, new folder)."""
+    name = name.strip()
+    if not name or name in {".", ".."}:
+        raise ValueError("Please enter a name.")
+    if "/" in name or "\\" in name:
+        raise ValueError("Names cannot contain / or \\.")
+    if name.casefold() in RESERVED_NAMES:
+        raise ValueError("That name is reserved by Folder Share. Please choose another.")
+    if any(ord(char) < 32 for char in name) or any(char in name for char in '<>:"|?*'):
+        raise ValueError('Names cannot contain < > : " | ? * or control characters.')
+    if name.endswith((" ", ".")):
+        raise ValueError("Names cannot end with a space or a dot.")
+    if name.split(".")[0].upper() in WINDOWS_RESERVED:
+        raise ValueError("That name is reserved by Windows. Please choose another.")
+    if len(name.encode("utf-8")) > 255:
+        raise ValueError("That name is too long.")
+    return name
+
+
+def clean_upload_name(name: str) -> str:
+    """Make an uploaded file name safe on every operating system."""
+    name = Path(name.replace("\\", "/")).name
+    name = re.sub(r'[<>:"|?*\x00-\x1f]', "_", name).strip().rstrip(". ")
+    if not name or name in {".", ".."}:
+        name = "file"
+    if name.casefold() in RESERVED_NAMES or name.split(".")[0].upper() in WINDOWS_RESERVED:
+        name = "_" + name
+    if len(name.encode("utf-8")) > 240:
+        path = Path(name)
+        name = path.stem[:150] + path.suffix[:20]
+    return name
+
+
+def unique_path(folder: Path, name: str) -> Path:
+    """Return folder/name, or 'name (1).ext', 'name (2).ext' ... if taken."""
+    candidate = folder / name
+    if not candidate.exists() and not candidate.is_symlink():
+        return candidate
+    stem, suffix = Path(name).stem, Path(name).suffix
+    for number in range(1, 1000):
+        candidate = folder / f"{stem} ({number}){suffix}"
+        if not candidate.exists() and not candidate.is_symlink():
+            return candidate
+    raise ValueError("There are too many files with that name already.")
+
+
+def friendly_error(exc: BaseException) -> str:
+    """Plain-language message that never leaks the owner's disk paths."""
+    if isinstance(exc, OSError):
+        if exc.errno is None:  # our own PermissionError("...") messages are already friendly
+            return str(exc)
+        if exc.errno == errno.ENOSPC:
+            return "The owner's disk is full."
+        if exc.errno in (errno.EACCES, errno.EPERM):
+            return "The owner's computer does not allow that change."
+        if exc.errno == errno.ENOENT:
+            return "That file or folder no longer exists. Refresh the page and try again."
+        if exc.errno == errno.EEXIST:
+            return "Something with that name already exists."
+        if exc.errno == errno.ENAMETOOLONG:
+            return "That name is too long."
+        return "That action could not be completed on the owner's computer."
+    if isinstance(exc, ValueError):
+        return str(exc)
+    return "Something went wrong. Please try again."
+
+
+def client_ip_for(peer: str, headers) -> str:
+    """Real visitor address. Behind the local Cloudflare tunnel every request
+    arrives from loopback, so forwarding headers are trusted only then."""
+    if peer in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+        candidate = (headers.get("CF-Connecting-IP") or (headers.get("X-Forwarded-For") or "").split(",")[0]).strip()
+        if candidate:
+            try:
+                return str(ipaddress.ip_address(candidate))
+            except ValueError:
+                pass
+    return peer
+
+
+def _entry_info(root: Path, item: Path):
+    """(is_dir, size) for entries inside the shared folder, else None.
+    Skips broken symlinks, unreadable entries and symlinks leaving the folder."""
+    try:
+        item.resolve().relative_to(root.resolve())
+        stat = item.stat()
+        return item.is_dir(), stat.st_size
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
 class ShareState:
     def __init__(self, folder: Path, password: str):
         self.folder = folder.resolve()
-        self.password_hash = hashlib.sha256(password.encode()).hexdigest()
+        self.salt = secrets.token_bytes(16)
+        self.password_hash = self._hash(password)
+        self.upload_names: dict[str, str] = {}
         self.connection_id = secrets.token_urlsafe(18)
         self.sessions: dict[str, dict] = {}
         self.login_failures: dict[str, list[float]] = {}
@@ -407,10 +638,11 @@ class ShareState:
         self.lock = threading.Lock()
         self._cleanup_upload_parts()
 
+    def _hash(self, password: str) -> bytes:
+        return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), self.salt, PBKDF2_ITERATIONS)
+
     def authenticate(self, supplied: str) -> bool:
-        return secrets.compare_digest(
-            hashlib.sha256(supplied.encode()).hexdigest(), self.password_hash
-        )
+        return secrets.compare_digest(self._hash(supplied), self.password_hash)
 
     def login_allowed(self, address: str) -> bool:
         now = time.time()
@@ -419,9 +651,16 @@ class ShareState:
             self.login_failures[address] = attempts
             return len(attempts) < LOGIN_MAX_FAILURES
 
-    def record_login_failure(self, address: str) -> None:
+    def record_login_failure(self, address: str) -> float:
+        """Record a wrong password. Returns how long to slow the reply down (seconds)."""
+        now = time.time()
         with self.lock:
-            self.login_failures.setdefault(address, []).append(time.time())
+            if len(self.login_failures) > 2000:
+                self.login_failures = {key: [t for t in value if now - t < LOGIN_WINDOW_SECONDS] for key, value in self.login_failures.items()}
+                self.login_failures = {key: value for key, value in self.login_failures.items() if value}
+            attempts = self.login_failures.setdefault(address, [])
+            attempts.append(now)
+            return min(0.5 * len(attempts), 5.0)
 
     def clear_login_failures(self, address: str) -> None:
         with self.lock:
@@ -553,7 +792,9 @@ class FolderHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
         self.send_header("Pragma", "no-cache")
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'")
+        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "same-origin")
         if headers:
             for key, value in headers.items():
                 self.send_header(key, value)
@@ -575,6 +816,47 @@ class FolderHandler(http.server.BaseHTTPRequestHandler):
         if extra_headers:
             for key, value in extra_headers.items():
                 self.send_header(key, value)
+        self.end_headers()
+
+    def _origin_ok(self) -> bool:
+        """Block cross-site form posts: Origin/Referer, when sent, must match Host."""
+        origin = self.headers.get("Origin") or self.headers.get("Referer")
+        if not origin:
+            return True
+        try:
+            return urlparse(origin).netloc.lower() == (self.headers.get("Host") or "").lower()
+        except ValueError:
+            return False
+
+    def _content_length(self, limit: int | None = None) -> int:
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            raise ValueError("The request was not understood.")
+        if length < 0 or (limit is not None and length > limit):
+            raise ValueError("The request is too large.")
+        return length
+
+    def _method_not_allowed(self):
+        self.send_response(405)
+        self.send_header("Allow", "GET, HEAD, POST, PUT")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    do_DELETE = do_PATCH = do_OPTIONS = _method_not_allowed
+
+    def do_HEAD(self):
+        parsed = urlparse(self.path)
+        if not self.state.valid_session(self._cookie()):
+            self.send_response(401)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if parsed.path == "/download":
+            self._download(parse_qs(parsed.query).get("path", [""])[0], head_only=True)
+            return
+        self.send_response(200 if parsed.path in {"/", "/browse", "/heartbeat"} else 404)
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
     def _require_login(self) -> bool:
@@ -628,12 +910,16 @@ class FolderHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         if parsed.path == "/login":
-            address = self.client_address[0]
+            if not self._origin_ok():
+                self._send_html(login_page("Please reload the page and try again."), 403)
+                return
+            address = client_ip_for(self.client_address[0], self.headers)
             if not self.state.login_allowed(address):
                 self._send_html(login_page("Too many incorrect attempts. Please wait 15 minutes and try again."), 429, {"Retry-After": str(LOGIN_WINDOW_SECONDS)})
                 return
-            length = int(self.headers.get("Content-Length", "0"))
-            if length > 20_000:
+            try:
+                length = self._content_length(20_000)
+            except ValueError:
                 self.send_error(413)
                 return
             raw = self.rfile.read(length).decode("utf-8", "replace")
@@ -644,8 +930,11 @@ class FolderHandler(http.server.BaseHTTPRequestHandler):
                 secure = "; Secure" if self.headers.get("X-Forwarded-Proto", "").lower() == "https" else ""
                 self._redirect("/", {"Set-Cookie": f"ffs_session={token}; HttpOnly; SameSite=Strict{secure}; Max-Age={SESSION_SECONDS}"})
             else:
-                self.state.record_login_failure(address)
+                time.sleep(self.state.record_login_failure(address))
                 self._send_html(login_page("Incorrect password. Please try again."), 401)
+            return
+        if not self._origin_ok():
+            self._send_json({"error": "This request was blocked for your safety. Reload the page and try again."}, 403)
             return
         if parsed.path == "/nickname":
             token = self._cookie()
@@ -665,44 +954,61 @@ class FolderHandler(http.server.BaseHTTPRequestHandler):
             upload_id = parse_qs(parsed.query).get("upload_id", [""])[0]
             self._cancel_upload(upload_id)
             return
+        form: dict[str, list[str]] = {}
         try:
-            if parsed.path == "/upload":
-                self._send_json({"error": "This upload route is disabled. Use the resumable chunked Upload button."}, 410)
-                return
             form = self._read_form()
+            rel = form.get("path", [""])[0]
             if parsed.path == "/mkdir":
-                parent = form.get("path", [""])[0]
-                name = form.get("name", [""])[0].strip()
-                if not name or name in {".", ".."} or "/" in name or "\\" in name:
-                    raise ValueError("Folder name is invalid")
-                safe_child(self.state.folder, parent).joinpath(name).mkdir()
+                parent = safe_child(self.state.folder, rel)
+                name = validate_name(form.get("name", [""])[0])
+                if not parent.is_dir():
+                    raise ValueError("That folder no longer exists.")
+                new_dir = parent / name
+                if new_dir.exists() or new_dir.is_symlink():
+                    raise ValueError(f"'{name}' already exists here.")
+                new_dir.mkdir()
+                back = rel
             elif parsed.path == "/delete":
-                target = safe_child(self.state.folder, form.get("path", [""])[0])
+                target = safe_child(self.state.folder, rel)
                 if target == self.state.folder:
                     raise ValueError("The shared folder itself cannot be deleted")
                 if target.is_dir():
                     shutil.rmtree(target)
                 else:
                     target.unlink()
+                back = str(Path(rel).parent).replace(os.sep, "/")
             elif parsed.path == "/rename":
-                target = safe_child(self.state.folder, form.get("path", [""])[0])
-                name = form.get("name", [""])[0].strip()
-                if not name or name in {".", ".."} or "/" in name or "\\" in name:
-                    raise ValueError("New name is invalid")
-                target.rename(target.parent / name)
+                target = safe_child(self.state.folder, rel)
+                name = validate_name(form.get("name", [""])[0])
+                if target == self.state.folder:
+                    raise ValueError("The shared folder itself cannot be renamed.")
+                destination = target.parent / name
+                if (destination.exists() or destination.is_symlink()) and not (destination.exists() and destination.samefile(target)):
+                    raise ValueError(f"'{name}' already exists here. Choose a different name.")
+                target.rename(destination)
+                back = str(Path(rel).parent).replace(os.sep, "/")
             else:
                 self.send_error(404)
                 return
-            self._redirect("/browse?path=" + quote(form.get("path", [""])[0]))
-        except (OSError, ValueError, PermissionError) as exc:
-            form = locals().get("form", {})
+            self._redirect("/browse?path=" + quote("" if back == "." else back))
+        except (OSError, ValueError) as exc:
             session = self.state.session(self._cookie()) or {}
-            self._send_html(file_page(self.state.folder, form.get("path", [""])[0], f"Could not complete that action: {html.escape(str(exc))}", nickname=session.get("nickname", ""), local_url=self._local_url()), 400)
+            back = str(Path(form.get("path", [""])[0]).parent).replace(os.sep, "/") if parsed.path in {"/delete", "/rename"} else form.get("path", [""])[0]
+            self._send_html(file_page(self.state.folder, "" if back == "." else back, html.escape(friendly_error(exc)), nickname=session.get("nickname", ""), local_url=self._local_url()), 400)
 
     def _local_url(self) -> str:
+        host = self.server.server_address[0]  # type: ignore[attr-defined]
+        if host in ("127.0.0.1", "::1"):
+            return ""  # same-Wi-Fi access is switched off
         return f"http://{local_ip()}:{self.server.server_address[1]}/"  # type: ignore[attr-defined]
 
     def do_PUT(self):
+        if not self._origin_ok():
+            self._send_json({"error": "This request was blocked for your safety. Reload the page and try again."}, 403)
+            return
+        if not self.state.valid_session(self._cookie()):
+            self._send_json({"error": "Your sign-in expired. Reload the page and sign in again."}, 401)
+            return
         if not self._require_login():
             return
         if urlparse(self.path).path != "/upload_chunk":
@@ -710,9 +1016,10 @@ class FolderHandler(http.server.BaseHTTPRequestHandler):
             return
         try:
             self._upload_chunk(parse_qs(urlparse(self.path).query))
-        except (OSError, ValueError, PermissionError) as exc:
-            self._send_json({"error": str(exc)}, 400)
+        except (OSError, ValueError) as exc:
+            self._send_json({"error": friendly_error(exc)}, 400)
         except Exception:
+            traceback.print_exc()
             self._send_json({"error": "The server could not process this upload chunk."}, 500)
 
     def _upload_chunk(self, query):
@@ -727,19 +1034,24 @@ class FolderHandler(http.server.BaseHTTPRequestHandler):
     def _upload_chunk_locked(self, query):
         upload_id = query.get("upload_id", [""])[0]
         relative = query.get("path", [""])[0]
-        filename = Path(query.get("name", [""])[0]).name
+        filename = clean_upload_name(query.get("name", [""])[0])
         try:
             offset = int(query.get("offset", ["0"])[0])
             total = int(query.get("total", ["0"])[0])
         except ValueError:
             raise ValueError("Invalid upload progress")
-        if not filename or filename in {".", ".."} or total <= 0 or total > MAX_UPLOAD_BYTES:
-            raise ValueError("Invalid file or file size")
+        if total <= 0:
+            raise ValueError("That file is empty or its size is unknown.")
+        if total > MAX_UPLOAD_BYTES:
+            raise ValueError(f"That file is larger than the {format_size(MAX_UPLOAD_BYTES)} limit.")
         if offset < 0 or offset > total:
             raise ValueError("Invalid upload offset")
-        length = int(self.headers.get("Content-Length", "0"))
+        length = self._content_length()
         if length <= 0 or offset + length > total:
             raise ValueError("Invalid upload chunk")
+        target_dir = safe_child(self.state.folder, relative)
+        if not target_dir.is_dir():
+            raise ValueError("That folder no longer exists, so the upload was stopped.")
         temp_dir = self.state.folder / ".folder_share_uploads"
         temp_dir.mkdir(exist_ok=True)
         temp = temp_dir / (upload_id + ".part")
@@ -747,24 +1059,42 @@ class FolderHandler(http.server.BaseHTTPRequestHandler):
         if current != offset:
             self._send_json({"error": "Upload position updated on the server", "offset": current, "resync": True}, 409)
             return
-        with temp.open("ab") as output:
-            remaining = length
-            while remaining:
-                data = self.rfile.read(min(1024 * 1024, remaining))
-                if not data:
-                    raise ValueError("Upload connection ended early")
-                output.write(data)
-                remaining -= len(data)
+        if offset == 0:
+            # Decide the final name and check disk space BEFORE any data is sent.
+            if shutil.disk_usage(self.state.folder).free < total + MIN_FREE_BYTES:
+                self._send_json({"error": "There is not enough free space on the owner's computer for this file."}, 507)
+                return
+            final_name = unique_path(target_dir, filename).name
+            with self.state.lock:
+                self.state.upload_names[upload_id] = final_name
+        else:
+            with self.state.lock:
+                final_name = self.state.upload_names.get(upload_id) or unique_path(target_dir, filename).name
+        try:
+            with temp.open("ab") as output:
+                remaining = length
+                while remaining:
+                    data = self.rfile.read(min(1024 * 1024, remaining))
+                    if not data:
+                        raise ValueError("Upload connection ended early")
+                    output.write(data)
+                    remaining -= len(data)
+        except OSError as exc:
+            if exc.errno == errno.ENOSPC:
+                temp.unlink(missing_ok=True)
+                self._send_json({"error": "The owner's disk is full, so the upload was cancelled."}, 507)
+                return
+            raise
         new_offset = offset + length
         if new_offset == total:
-            destination = safe_child(self.state.folder, relative) / filename
-            if destination.exists():
-                temp.unlink(missing_ok=True)
-                raise ValueError("A file with that name already exists")
+            destination = unique_path(target_dir, final_name)
             temp.replace(destination)
-            self._send_json({"offset": new_offset, "complete": True})
+            with self.state.lock:
+                self.state.upload_names.pop(upload_id, None)
+                self.state.upload_locks.pop(upload_id, None)
+            self._send_json({"offset": new_offset, "complete": True, "name": destination.name})
         else:
-            self._send_json({"offset": new_offset, "complete": False})
+            self._send_json({"offset": new_offset, "complete": False, "name": final_name})
 
     def _cancel_upload(self, upload_id: str):
         if not re.fullmatch(r"[A-Za-z0-9_-]{16,80}", upload_id):
@@ -772,104 +1102,72 @@ class FolderHandler(http.server.BaseHTTPRequestHandler):
             return
         temp = self.state.folder / ".folder_share_uploads" / (upload_id + ".part")
         temp.unlink(missing_ok=True)
+        with self.state.lock:
+            self.state.upload_names.pop(upload_id, None)
         self._send_json({"cancelled": True})
 
     def _read_form(self) -> dict[str, list[str]]:
         """Read normal HTML form fields from the POST body, not the URL."""
-        length = int(self.headers.get("Content-Length", "0"))
-        if length > 100_000:
-            raise ValueError("Form is too large")
+        length = self._content_length(100_000)
         raw = self.rfile.read(length).decode("utf-8", "replace")
         return parse_qs(raw)
 
-    def _download(self, relative: str):
+    def _download(self, relative: str, head_only: bool = False):
         try:
             target = safe_child(self.state.folder, relative)
             if not target.is_file():
                 raise FileNotFoundError
             size = target.stat().st_size
-            start, end = 0, size - 1
-            range_header = self.headers.get("Range", "")
-            if range_header.startswith("bytes="):
-                match = re.fullmatch(r"(\d*)-(\d*)", range_header[6:].strip())
-                if not match:
-                    self.send_error(416, "Invalid byte range")
-                    return
-                if match.group(1):
-                    start = int(match.group(1))
-                    end = int(match.group(2)) if match.group(2) else size - 1
-                elif match.group(2):
-                    length = int(match.group(2)); start = max(0, size - length)
-                if start >= size or end < start:
-                    self.send_response(416)
-                    self.send_header("Content-Range", f"bytes */{size}")
-                    self.end_headers()
-                    return
-                end = min(end, size - 1)
-            partial = start != 0 or end != size - 1
-            self.send_response(206 if partial else 200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(end - start + 1))
-            self.send_header("Accept-Ranges", "bytes")
-            if partial:
-                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-            safe_name = "".join(char for char in target.name if ord(char) >= 32 and char not in {'"', "\\"}) or "download"
-            self.send_header("Content-Disposition", f'attachment; filename="{safe_name}"')
-            self.end_headers()
+        except (OSError, PermissionError):
+            self.send_error(404, "File not found")
+            return
+        start, end = 0, size - 1
+        range_header = self.headers.get("Range", "")
+        if range_header.startswith("bytes="):
+            match = re.fullmatch(r"(\d*)-(\d*)", range_header[6:].strip())
+            if not match:
+                self.send_error(416, "Invalid byte range")
+                return
+            if match.group(1):
+                start = int(match.group(1))
+                end = int(match.group(2)) if match.group(2) else size - 1
+            elif match.group(2):
+                start = max(0, size - int(match.group(2)))
+            if start >= size or end < start:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            end = min(end, size - 1)
+        partial = start != 0 or end != size - 1
+        ascii_name = "".join(char if 32 <= ord(char) < 127 and char not in '"\\;%' else "_" for char in target.name) or "download"
+        self.send_response(206 if partial else 200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(end - start + 1))
+        self.send_header("Accept-Ranges", "bytes")
+        if partial:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header("Content-Disposition", f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(target.name, safe='')}")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if head_only:
+            return
+        try:
             with target.open("rb") as file:
                 file.seek(start)
                 remaining = end - start + 1
                 while remaining:
                     block = file.read(min(1024 * 1024, remaining))
-                    if not block: break
+                    if not block:
+                        break
                     self.wfile.write(block)
                     remaining -= len(block)
-        except (OSError, PermissionError):
-            self.send_error(404, "File not found")
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            self.close_connection = True  # the visitor closed the page or lost signal
+        except OSError:
+            self.close_connection = True  # file vanished or unreadable mid-download
 
-    def _upload(self):
-        length = int(self.headers.get("Content-Length", "0"))
-        if length <= 0 or length > MAX_UPLOAD_BYTES + 1_000_000:
-            raise ValueError("Upload is empty or larger than the 512 MB limit")
-        content_type = self.headers.get("Content-Type", "")
-        boundary_marker = "boundary="
-        if boundary_marker not in content_type:
-            raise ValueError("Unsupported upload format")
-        boundary = content_type.split(boundary_marker, 1)[1].encode()
-        body = self.rfile.read(length)
-        # Simple multipart parser sufficient for a single browser file input.
-        fields: dict[str, bytes] = {}
-        file_name = ""
-        file_data = b""
-        for part in body.split(b"--" + boundary):
-            header_end = part.find(b"\r\n\r\n")
-            if header_end < 0:
-                continue
-            headers = part[:header_end].decode("utf-8", "replace")
-            data = part[header_end + 4:]
-            if data.endswith(b"\r\n"):
-                data = data[:-2]
-            disposition = next((line for line in headers.split("\r\n") if line.lower().startswith("content-disposition:")), "")
-            name_match = re.search(r'name="([^"]+)"', disposition)
-            if not name_match:
-                continue
-            field_name = name_match.group(1)
-            filename_match = re.search(r'filename="([^"]*)"', disposition)
-            if filename_match:
-                file_name = Path(filename_match.group(1)).name
-                file_data = data
-            else:
-                fields[field_name] = data
-        if not file_name:
-            raise ValueError("No file was selected")
-        relative = fields.get("path", b"").decode("utf-8", "replace")
-        if len(file_data) > MAX_UPLOAD_BYTES:
-            raise ValueError(f"Upload exceeds the {format_size(MAX_UPLOAD_BYTES)} limit")
-        destination = safe_child(self.state.folder, relative) / file_name
-        if destination.exists():
-            raise ValueError("A file with that name already exists")
-        destination.write_bytes(file_data)
-        self._redirect("/browse?path=" + quote(relative))
 
 
 def login_page(message="") -> str:
@@ -898,7 +1196,9 @@ def search_files(root: Path, query: str, limit: int = 200) -> list[tuple[Path, s
         for item in root.rglob("*"):
             if len(found) >= limit:
                 break
-            if ".folder_share_uploads" in item.parts or not item.is_file() and not item.is_dir():
+            if ".folder_share_uploads" in item.parts or ".folder_share_trash" in item.parts or not item.is_file() and not item.is_dir():
+                continue
+            if _entry_info(root, item) is None:
                 continue
             try:
                 relative = str(item.relative_to(root)).replace(os.sep, "/")
@@ -919,16 +1219,28 @@ def file_page(root: Path, relative: str, message="", nickname="", search_query="
             relative = str(current.relative_to(root)).replace(os.sep, "/")
     except (PermissionError, OSError):
         current, relative = root, ""
-    entries = search_files(root, search_query) if search_query else sorted((item for item in current.iterdir() if item.name != ".folder_share_uploads"), key=lambda p: (not p.is_dir(), p.name.lower()))
+    try:
+        entries = search_files(root, search_query) if search_query else sorted((item for item in current.iterdir() if item.name not in RESERVED_NAMES), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except OSError:
+        entries = []
+        message = message or "This folder could not be read."
     rows = []
     for entry in entries:
         item, found_rel = entry if search_query else (entry, "")
+        info = _entry_info(root, item)
+        if info is None:
+            continue  # broken or escaping symlink, unreadable file
+        is_dir, size = info
         rel = found_rel if search_query else str(item.relative_to(root)).replace(os.sep, "/")
         name = html.escape(item.name)
-        if item.is_dir():
-            rows.append(f"<tr><td>📁 <a href='/browse?path={quote(rel)}'>{name}</a></td><td>Folder</td><td><form class=inline method=post action=/rename><input type=hidden name=path value='{html.escape(rel)}'><input name=name placeholder='New name' required><button>Rename</button></form> <form class=inline method=post action=/delete onsubmit=\"return confirm('Delete this folder and everything in it?')\"><input type=hidden name=path value='{html.escape(rel)}'><button class=danger>Delete</button></form></td></tr>")
+        safe_rel = html.escape(rel)
+        question = "Delete this folder and everything in it?" if is_dir else "Delete this file?"
+        forms = (f"<form class=inline method=post action=/rename><input type=hidden name=path value='{safe_rel}'><input name=name placeholder='New name' required><button>Rename</button></form> "
+                 f"<form class=inline method=post action=/delete onsubmit=\"return confirm('{question}')\"><input type=hidden name=path value='{safe_rel}'><button class=danger>Delete</button></form>")
+        if is_dir:
+            rows.append(f"<tr><td>📁 <a href='/browse?path={quote(rel)}'>{name}</a></td><td>Folder</td><td>{forms}</td></tr>")
         else:
-            rows.append(f"<tr><td>📄 {name}</td><td>{format_size(item.stat().st_size)}</td><td><button class=button onclick=\"startDownload('/download?path={quote(rel)}','{html.escape(item.name, quote=True)}',{item.stat().st_size})\">Download</button> <form class=inline method=post action=/rename><input type=hidden name=path value='{html.escape(rel)}'><input name=name placeholder='New name' required><button>Rename</button></form> <form class=inline method=post action=/delete onsubmit=\"return confirm('Delete this file?')\"><input type=hidden name=path value='{html.escape(rel)}'><button class=danger>Delete</button></form></td></tr>")
+            rows.append(f"<tr><td>📄 {name}</td><td>{format_size(size)}</td><td><a class=button href='/download?path={quote(rel)}' download>Download</a> {forms}</td></tr>")
     parent = ""
     if relative:
         parent_rel = str(Path(relative).parent).replace(os.sep, "/")
@@ -945,7 +1257,7 @@ def file_page(root: Path, relative: str, message="", nickname="", search_query="
 {('<div class=notice>' + message + '</div>') if message else ''}{local_note}<p>{parent}</p><h2>📂 {crumb}</h2>
 
 {search_box}
-	<section class=actions><div class=upload-box><label for=upload-file>Choose one or more files</label><input id=upload-file type=file multiple onchange="selectFile(this, '{html.escape(relative)}')"><button id=start-upload onclick="startUpload()">Upload selected files</button><div id=upload-status class=muted>Choose files, then press Upload selected files.</div><progress id=upload-progress max=100 value=0 hidden></progress><div id=upload-buttons class=upload-buttons hidden><button id=pause-upload onclick="pauseUpload()">Pause</button><button id=resume-upload onclick="resumeUpload()" disabled>Resume</button><button id=cancel-upload class=danger onclick="cancelUpload()">Cancel</button></div></div><form method=post action=/mkdir><input type=hidden name=path value='{html.escape(relative)}'><input name=name placeholder='New folder name' required><button>New folder</button></form></section><details id=transfer-manager class=transfer-manager><summary id=transfer-summary>Transfers: idle</summary><div id=transfer-list class=muted>Nothing is transferring.</div></details><p class=muted>Edits here happen immediately in the selected folder on the owner’s computer.</p>
+	<section class=actions><div class=upload-box><label for=upload-file>Choose one or more files</label><input id=upload-file type=file multiple data-path='{html.escape(relative)}' onchange="selectFile(this, this.dataset.path)"><button id=start-upload onclick="startUpload()">Upload selected files</button><div id=upload-status class=muted>Choose files, then press Upload selected files.</div><progress id=upload-progress max=100 value=0 hidden></progress><div id=upload-buttons class=upload-buttons hidden><button id=pause-upload onclick="pauseUpload()">Pause</button><button id=resume-upload onclick="resumeUpload()" disabled>Resume</button><button id=cancel-upload class=danger onclick="cancelUpload()">Cancel</button></div></div><form method=post action=/mkdir><input type=hidden name=path value='{html.escape(relative)}'><input name=name placeholder='New folder name' required><button>New folder</button></form></section><details id=transfer-manager class=transfer-manager><summary id=transfer-summary>Transfers: idle</summary><div id=transfer-list class=muted>Nothing is transferring.</div></details><p class=muted>Edits here happen immediately in the selected folder on the owner’s computer.</p>
 <table><tr><th>Name</th><th>Size</th><th>Actions</th></tr>{''.join(rows) or '<tr><td colspan=3 class=muted>This folder is empty.</td></tr>'}</table><footer>Folder Share v{APP_VERSION} · Browser and AI tools can use this page with the URL and password.</footer></main>{page_script}"""
 
 
@@ -953,15 +1265,10 @@ UPLOAD_JS = """<script>
 let upload = null;
 let uploadQueue = [];
 let transferJobs = [];
-let downloadJobs = [];
 // Smaller chunks make progress and pause/resume responsive on slow mobile links.
-const CHUNK = 512 * 1024;
+const CHUNK = 2 * 1024 * 1024;
 const LOCAL_BASE = __LOCAL_BASE__;
-let transferBase = location.origin;
-// When this page was opened through the LAN address, all transfers are local.
-// A page opened through HTTPS cannot silently use HTTP LAN content in many browsers;
-// in that case the public HTTPS URL remains the secure fallback.
-if (LOCAL_BASE && location.protocol === 'http:' && location.hostname !== '127.0.0.1' && location.hostname !== 'localhost') transferBase = location.origin;
+const transferBase = '';
 function updateConnectionNotice() {
   const note = document.getElementById('connection-note'); if (!note || !LOCAL_BASE) return;
   const detail = document.getElementById('connection-detail'), link = document.getElementById('local-link');
@@ -1018,12 +1325,18 @@ async function uploadNext() {
   try {
     const result = await sendChunk(u, qs, chunk);
     if (result.resync) { u.offset = result.offset; if (!u.paused) uploadNext(); else document.getElementById('upload-status').textContent = `Paused at ${Math.round(u.offset/u.file.size*100)}%`; return; }
-    u.offset = result.offset;
+    u.offset = result.offset; u.retries = 0;
+    if (result.name) u.savedAs = result.name;
     updateUploadStatus(u, u.offset, true);
-    if (result.complete) { upload.state = 'completed'; document.getElementById('upload-status').textContent = `${upload.file.name} complete`; renderTransfers(); beginNextUpload(); }
+    if (result.complete) { upload.state = 'completed'; document.getElementById('upload-status').textContent = upload.savedAs && upload.savedAs !== upload.file.name ? `${upload.file.name} uploaded as “${upload.savedAs}” (a file with that name already existed)` : `${upload.file.name} complete`; renderTransfers(); beginNextUpload(); }
     else { renderTransfers(); uploadNext(); }
   } catch (error) {
     if (error.name === 'AbortError') return;
+    if (!error.permanent && !u.paused && !u.cancelled && (u.retries = (u.retries || 0) + 1) <= 5) {
+      document.getElementById('upload-status').textContent = `Connection problem. Retrying (${u.retries}/5)…`;
+      setTimeout(() => { if (upload === u && !u.paused && !u.cancelled) uploadNext(); }, Math.min(16000, 1000 * 2 ** (u.retries - 1)));
+      return;
+    }
     document.getElementById('upload-status').textContent = 'Upload error: ' + error.message;
     if (upload) { upload.state = 'paused'; renderTransfers(); }
     document.getElementById('pause-upload').disabled = true;
@@ -1042,7 +1355,7 @@ function sendChunk(u, qs, chunk) {
     };
     xhr.onload = () => {
       let result; try { result = JSON.parse(xhr.responseText); } catch (_) { reject(new Error(`The server returned an unexpected response (${xhr.status}). Try again or restart sharing.`)); return; }
-      if (xhr.status >= 200 && xhr.status < 300) resolve(result); else if (result.resync) resolve(result); else reject(new Error(result.error || `Upload failed (${xhr.status})`));
+      if (xhr.status >= 200 && xhr.status < 300) resolve(result); else if (result.resync) resolve(result); else { const failure = new Error(result.error || `Upload failed (${xhr.status})`); failure.permanent = (xhr.status >= 400 && xhr.status < 500) || xhr.status === 507; reject(failure); }
     };
     xhr.onerror = () => reject(new Error('The connection was interrupted. You can press Resume to try again.'));
     xhr.onabort = () => reject(new DOMException('Upload paused or cancelled', 'AbortError'));
@@ -1050,7 +1363,7 @@ function sendChunk(u, qs, chunk) {
   });
 }
 function updateUploadStatus(u, transferred, finalUpdate) {
-  const seconds = Math.max((Date.now()-u.started)/1000, .1), speed = transferred/seconds, remaining = speed ? Math.max(0, Math.round((u.file.size-transferred)/speed)) : 0, percent = Math.min(100, Math.round(transferred/u.file.size*100));
+  const seconds = Math.max((Date.now()-u.started)/1000, .1), speed = Math.max(0, transferred-(u.startOffset||0))/seconds, remaining = speed ? Math.max(0, Math.round((u.file.size-transferred)/speed)) : 0, percent = Math.min(100, Math.round(transferred/u.file.size*100));
   document.getElementById('upload-progress').value = percent;
   if (transferred <= 0) document.getElementById('upload-status').textContent = `0% · 0 B of ${formatBytes(u.file.size)} · measuring speed…`;
   else document.getElementById('upload-status').textContent = `${percent}% · ${formatBytes(transferred)} of ${formatBytes(u.file.size)} · ${formatBytes(speed)}/s · about ${remaining}s left`;
@@ -1061,33 +1374,11 @@ function renderTransfers() {
   const total = transferJobs.length, done = transferJobs.filter(j => j.state === 'completed').length, active = transferJobs.find(j => j.state === 'uploading');
   const combined = transferJobs.reduce((sum, j) => sum + (j.progress ? j.size*j.progress/100 : j.state === 'completed' ? j.size : 0), 0), bytes = transferJobs.reduce((sum,j)=>sum+j.size,0);
   summary.textContent = total ? `Transfers: ${done}/${total} complete · ${formatBytes(combined)} of ${formatBytes(bytes)}` : 'Transfers: idle';
-  list.innerHTML = transferJobs.map(j => `<div class=transfer-row><strong>${escapeHtml(j.name)}</strong><span>${j.state}${j.progress != null ? ` · ${j.progress}%` : ''}${j.speed ? ` · ${formatBytes(j.speed)}/s` : ''}${j.kind === 'download' && j.state === 'downloading' ? ` <button onclick="pauseDownload('${j.id}')">Pause</button><button class=danger onclick="cancelDownload('${j.id}')">Cancel</button>` : ''}${j.kind === 'download' && j.state === 'paused' ? ` <button onclick="resumeDownload('${j.id}')">Resume</button><button class=danger onclick="cancelDownload('${j.id}')">Cancel</button>` : ''}</span></div>`).join('') || 'Nothing is transferring.';
+  list.innerHTML = transferJobs.map(j => `<div class=transfer-row><strong>${escapeHtml(j.name)}</strong><span>${j.state}${j.progress != null ? ` · ${j.progress}%` : ''}${j.speed ? ` · ${formatBytes(j.speed)}/s` : ''}</span></div>`).join('') || 'Nothing is transferring.';
 }
 function escapeHtml(value) { return String(value).replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c])); }
-function startDownload(url, name, size) {
-  const job = {id:'d'+Date.now()+Math.random().toString(36).slice(2), kind:'download', url, name, size, offset:0, chunks:[], state:'downloading', progress:0, speed:0, started:Date.now(), controller:null};
-  downloadJobs.push(job); transferJobs.push(job); renderTransfers(); downloadNext(job);
-}
-async function downloadNext(job) {
-  if (job.state !== 'downloading') return;
-  try {
-    const end = Math.min(job.offset + 1024*1024, job.size) - 1;
-    job.controller = new AbortController();
-    const response = await fetch(transferBase + job.url, {headers:{Range:`bytes=${job.offset}-${end}`}, credentials:'include', cache:'no-store', signal:job.controller.signal});
-    if (!response.ok && response.status !== 206) throw new Error(`Download failed (${response.status})`);
-    const data = new Uint8Array(await response.arrayBuffer());
-    if (!data.length) throw new Error('The connection returned no data.');
-    job.chunks.push(data); job.offset += data.length; job.progress = Math.min(100, Math.round(job.offset/job.size*100));
-    const seconds=Math.max((Date.now()-job.started)/1000,.1); job.speed=job.offset/seconds; renderTransfers();
-    if (job.offset < job.size) downloadNext(job);
-    else { job.state='completed'; const blob=new Blob(job.chunks); const link=document.createElement('a'); link.href=URL.createObjectURL(blob); link.download=job.name; link.click(); setTimeout(()=>URL.revokeObjectURL(link.href),60000); renderTransfers(); }
-  } catch (error) { if (job.state !== 'cancelled') { job.state='paused'; job.error=error.message; renderTransfers(); } }
-}
-function pauseDownload(id) { const job=downloadJobs.find(item=>item.id===id); if (!job || job.state !== 'downloading') return; job.state='paused'; if (job.controller) job.controller.abort(); renderTransfers(); }
-function resumeDownload(id) { const job=downloadJobs.find(item=>item.id===id); if (!job) return; job.state='downloading'; job.started=Date.now()-(job.offset/Math.max(job.speed,1))*1000; renderTransfers(); downloadNext(job); }
-function cancelDownload(id) { const job=downloadJobs.find(item=>item.id===id); if (!job) return; job.state='cancelled'; job.chunks=[]; renderTransfers(); }
 function pauseUpload() { if (!upload) return; upload.paused = true; upload.state = 'paused'; if (upload.xhr) upload.xhr.abort(); document.getElementById('upload-status').textContent = `Paused at ${Math.round(upload.offset/upload.file.size*100)}%`; document.getElementById('pause-upload').disabled = true; document.getElementById('resume-upload').disabled = false; renderTransfers(); }
-function resumeUpload() { if (!upload) return; upload.paused = false; upload.state = 'uploading'; upload.started = Date.now() - (upload.offset / Math.max(upload.offset,1))*1000; document.getElementById('pause-upload').disabled = false; document.getElementById('resume-upload').disabled = true; renderTransfers(); uploadNext(); }
+function resumeUpload() { if (!upload) return; upload.paused = false; upload.state = 'uploading'; upload.started = Date.now(); upload.startOffset = upload.offset; document.getElementById('pause-upload').disabled = false; document.getElementById('resume-upload').disabled = true; renderTransfers(); uploadNext(); }
 async function cancelUpload() { if (!upload) return; upload.cancelled = true; upload.state = 'cancelled'; if (upload.xhr) upload.xhr.abort(); await fetch(transferBase + '/cancel_upload?upload_id=' + encodeURIComponent(upload.id), {method:'POST'}); document.getElementById('upload-status').textContent = 'Upload cancelled. Choose another file or press Upload again.'; document.getElementById('upload-progress').value = 0; document.getElementById('upload-buttons').hidden = true; document.getElementById('upload-file').disabled = false; document.getElementById('start-upload').disabled = false; upload = null; renderTransfers(); }
 function formatBytes(n) { if (!n) return '0 B'; const units=['B','KB','MB','GB']; let i=0; while(n>=1024 && i<units.length-1){n/=1024;i++;} return n.toFixed(i?1:0)+' '+units[i]; }
 setInterval(() => fetch('/heartbeat', {credentials:'same-origin', cache:'no-store'}).catch(() => {}), 30000);
@@ -1099,12 +1390,19 @@ CSS = """body{font:16px system-ui,-apple-system,Segoe UI,sans-serif;background:#
 class App:
     def __init__(self, window: tk.Tk):
         self.window = window
+        self.ui_queue: queue.Queue = queue.Queue()
+        self.window.after(100, self._pump_ui)
         self.window.title(APP_TITLE)
         self.window.geometry("680x560")
         self.window.minsize(600, 500)
         self.server: ReusableServer | None = None
         self.thread: threading.Thread | None = None
         self.tunnel_process: subprocess.Popen | None = None
+        self.tunnel_generation = 0
+        self.tunnel_retry_count = 0
+        self.server_port = 0
+        self.cloudflared_path = None
+        self.bind_host = "127.0.0.1"
         self.share_state: ShareState | None = None
         self.device_window = None
         self.device_tree = None
@@ -1114,22 +1412,45 @@ class App:
         self.password = ""
         self.password_var = tk.StringVar()
         self.public_var = tk.BooleanVar(value=True)
+        self.lan_var = tk.BooleanVar(value=False)
+        self.qr_password_var = tk.BooleanVar(value=False)
         self.url_var = tk.StringVar(value="Server is stopped")
         self.local_url_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Choose a folder to begin.")
         self.public_url = ""
         self.setup_frame = None
         self.command_notice_shown = False
-        try:
-            self.command_path = install_sharer_command()
-        except OSError:
-            self.command_path = str(Path(__file__).resolve())
+        self.command_path = str(Path(__file__).resolve())
+        if launcher_installed():  # keep an already-installed launcher pointing at this file
+            try:
+                install_sharer_command()
+            except OSError:
+                pass
         self.previous_version = record_and_get_previous_version()
         if not SETUP_MARKER.exists() or not (CLOUDFLARED_DIR / ("cloudflared.exe" if os.name == "nt" else "cloudflared")).exists():
             self._build_setup()
         else:
             self._build_main()
         self.window.protocol("WM_DELETE_WINDOW", self.close)
+
+    def ui(self, function, *args):
+        """Run function(*args) on the Tk thread (safe to call from worker threads)."""
+        self.ui_queue.put((function, args))
+
+    def _pump_ui(self):
+        try:
+            while True:
+                function, args = self.ui_queue.get_nowait()
+                try:
+                    function(*args)
+                except Exception:
+                    traceback.print_exc()
+        except queue.Empty:
+            pass
+        try:
+            self.window.after(100, self._pump_ui)
+        except tk.TclError:
+            pass  # window was closed
 
     def _build_setup(self):
         self.window.title("Welcome · " + APP_TITLE)
@@ -1163,12 +1484,12 @@ class App:
 
     def _setup_worker(self):
         try:
-            ensure_cloudflared(lambda text, fraction: self.window.after(0, self._setup_progress_update, text, fraction))
+            ensure_cloudflared(lambda text, fraction: self.ui(self._setup_progress_update, text, fraction))
             CLOUDFLARED_DIR.mkdir(parents=True, exist_ok=True)
             SETUP_MARKER.write_text("Folder Share setup complete\n", encoding="utf-8")
-            self.window.after(0, self._setup_finished)
+            self.ui(self._setup_finished)
         except (OSError, urllib.error.URLError, RuntimeError, json.JSONDecodeError, tarfile.TarError) as exc:
-            self.window.after(0, lambda: self._setup_error(str(exc)))
+            self.ui(lambda: self._setup_error(str(exc)))
 
     def _setup_progress_update(self, text: str, fraction: float | None):
         self.setup_status.set(text)
@@ -1207,8 +1528,16 @@ class App:
         password_box = ttk.LabelFrame(outer, text="Choose a password", padding=12)
         password_box.pack(fill="x", pady=(0, 12))
         ttk.Label(password_box, text=f"Use at least {MIN_PASSWORD_LENGTH} characters. Do not reuse an important password.").pack(anchor="w")
-        ttk.Entry(password_box, textvariable=self.password_var, show="•", width=42).pack(anchor="w", pady=(7, 0))
+        password_row = ttk.Frame(password_box)
+        password_row.pack(anchor="w", pady=(7, 0))
+        self.password_entry = ttk.Entry(password_row, textvariable=self.password_var, show="•", width=34)
+        self.password_entry.pack(side="left")
+        self.show_password_button = ttk.Button(password_row, text="Show", width=6, command=self.toggle_password)
+        self.show_password_button.pack(side="left", padx=(6, 0))
+        ttk.Button(password_row, text="Generate", command=self.generate_password).pack(side="left", padx=(6, 0))
+        ttk.Button(password_row, text="Copy", width=6, command=self.copy_password).pack(side="left", padx=(6, 0))
         ttk.Checkbutton(password_box, text="Create an encrypted HTTPS internet link (recommended)", variable=self.public_var).pack(anchor="w", pady=(9, 0))
+        ttk.Checkbutton(password_box, text="Also allow direct access on the same Wi-Fi (not encrypted)", variable=self.lan_var).pack(anchor="w", pady=(4, 0))
         self.start_button = ttk.Button(outer, text="Start secure sharing", command=self.start, state="disabled")
         self.start_button.pack(anchor="w")
         box = ttk.LabelFrame(outer, text="Share details", padding=14)
@@ -1219,6 +1548,11 @@ class App:
         self.password_label.pack(anchor="w", pady=(8, 0))
         self.qr_button = ttk.Button(box, text="Show QR code for a friend", command=self.show_qr, state="disabled")
         self.qr_button.pack(anchor="w", pady=(9, 0))
+        ttk.Checkbutton(box, text="Include the password in the QR code (anyone who scans it gets in)", variable=self.qr_password_var).pack(anchor="w", pady=(4, 0))
+        copy_row = ttk.Frame(box)
+        copy_row.pack(anchor="w", pady=(9, 0))
+        ttk.Button(copy_row, text="Copy link", command=self.copy_link).pack(side="left")
+        ttk.Button(copy_row, text="Copy message for a friend", command=self.copy_message).pack(side="left", padx=(8, 0))
         self.progress = ttk.Progressbar(outer, mode="indeterminate", length=360)
         self.progress.pack(anchor="w", pady=(12, 0))
         ttk.Label(outer, textvariable=self.status_var, wraplength=580).pack(anchor="w")
@@ -1226,51 +1560,158 @@ class App:
         self.stop_button.pack(anchor="e", pady=(18, 0))
         self.devices_button = ttk.Button(outer, text="Connected devices (0)", command=self.show_devices, state="disabled")
         self.devices_button.pack(anchor="e", pady=(8, 0))
+        footer = ttk.Frame(outer)
+        footer.pack(fill="x", pady=(14, 0))
+        ttk.Button(footer, text="Check for updates", command=self.check_updates_now).pack(side="left")
+        if launcher_installed():
+            ttk.Button(footer, text=f"Remove '{LAUNCH_COMMAND}' command", command=self.remove_launcher).pack(side="left", padx=(8, 0))
         if should_show_update_notice(self.previous_version):
             self.window.after(350, self._show_version_notice)
         elif should_show_command_notice(self.command_path):
             self.window.after(350, self._show_command_notice)
         self.window.after(1200, self.check_for_updates_async)
+        self.window.after(1500, confirm_update_started)
+        if ROLLBACK_NOTICE_PATH.exists():
+            self.window.after(600, self._show_rollback_notice)
 
     def check_for_updates_async(self):
         threading.Thread(target=self._update_check_worker, daemon=True).start()
+        self.window.after(6 * 60 * 60 * 1000, self.check_for_updates_async)  # and again every 6 hours
 
     def _update_check_worker(self):
         release = fetch_latest_release()
         if release:
-            self.window.after(0, self._show_update_banner, release)
+            self.ui(self._show_update_banner, release)
+
+    def _skipped_version(self) -> str:
+        try:
+            return UPDATE_SKIPPED_PATH.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
 
     def _show_update_banner(self, release):
         self.pending_release = release
+        if release["version"] == self._skipped_version() and not release.get("critical"):
+            return
         if self.server:
-            self.status_var.set(f"Update {release['version']} is ready and will be available after sharing stops.")
+            self.status_var.set(f"Update {release['version']} is ready. It can be installed after sharing stops.")
             return
         if not self.update_banner or self.update_banner.winfo_ismapped():
             return
         for child in self.update_banner.winfo_children():
             child.destroy()
-        ttk.Label(self.update_banner, text=f"A new version ({release['version']}) is available.", font=("TkDefaultFont", 11, "bold")).pack(side="left")
-        ttk.Label(self.update_banner, text="Review and install it when you are not sharing.", wraplength=280).pack(side="left", padx=12)
-        ttk.Button(self.update_banner, text="Update now", command=self.update_now).pack(side="right")
+        urgent = release.get("critical") or (release.get("min_version") and version_tuple(APP_VERSION) < version_tuple(release["min_version"]))
+        title = f"Please update to keep sharing safely (version {release['version']})" if urgent else f"A new version ({release['version']}) is available."
+        ttk.Label(self.update_banner, text=title, font=("TkDefaultFont", 11, "bold"), wraplength=560).pack(anchor="w")
+        if release.get("notes"):
+            notes = tk.Text(self.update_banner, height=5, width=64, wrap="word")
+            notes.insert("1.0", "What's new:\n" + release["notes"][:1500])
+            notes.config(state="disabled")
+            notes.pack(fill="x", pady=(6, 6))
+        buttons = ttk.Frame(self.update_banner)
+        buttons.pack(anchor="e")
+        ttk.Button(buttons, text="Update now", command=self.update_now).pack(side="left", padx=(0, 6))
+        if not release.get("critical"):
+            ttk.Button(buttons, text="Remind me later", command=self.hide_update_banner).pack(side="left", padx=(0, 6))
+            ttk.Button(buttons, text="Skip this version", command=self.skip_update).pack(side="left")
         self.update_banner.pack(fill="x", pady=(0, 12), before=self.choose_button)
+
+    def hide_update_banner(self):
+        self.update_banner.pack_forget()
+
+    def skip_update(self):
+        if self.pending_release:
+            try:
+                UPDATE_SKIPPED_PATH.parent.mkdir(parents=True, exist_ok=True)
+                UPDATE_SKIPPED_PATH.write_text(self.pending_release["version"] + "\n", encoding="utf-8")
+            except OSError:
+                pass
+        self.hide_update_banner()
+        self.status_var.set("Okay, we will not remind you about that version. 'Check for updates' still finds it.")
+
+    def check_updates_now(self):
+        self.status_var.set("Checking for updates…")
+        def work():
+            self.ui(self._manual_check_done, fetch_latest_release())
+        threading.Thread(target=work, daemon=True).start()
+
+    def _manual_check_done(self, release):
+        if release:
+            if release["version"] == self._skipped_version():
+                UPDATE_SKIPPED_PATH.unlink(missing_ok=True)
+            self.status_var.set(f"Version {release['version']} is available.")
+            self._show_update_banner(release)
+        else:
+            self.status_var.set(f"Version {APP_VERSION} · Up to date ✓ (or the update server could not be reached)")
 
     def update_now(self):
         if not self.pending_release:
             return
         if self.server:
-            messagebox.showinfo("Sharing is active", "Stop sharing before installing an update. Your connected users will not be interrupted.")
+            messagebox.showinfo("Sharing is active", "Stop sharing before installing an update. People connected right now will not be interrupted until you stop.")
             return
         if not messagebox.askyesno("Install update", f"Download and install Folder Share {self.pending_release['version']} now?"):
             return
-        self.status_var.set("Downloading and checking the update…")
         threading.Thread(target=self._update_install_worker, args=(self.pending_release,), daemon=True).start()
 
     def _update_install_worker(self, release):
         try:
-            install_verified_update(release)
-            self.window.after(0, lambda: (self.status_var.set(f"Updated to {release['version']}. Restarting…"), os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])))
+            install_verified_update(release, progress=lambda text: self.ui(self.status_var.set, text))
         except (OSError, ValueError, UnicodeError, SyntaxError) as exc:
-            self.window.after(0, lambda: messagebox.showerror("Update could not be installed", f"The update was not installed. Your current version is still safe.\n\nDetails: {exc}"))
+            self.ui(self.status_var.set, "The update was not installed. Your current version is unchanged.")
+            self.ui(messagebox.showerror, "Update could not be installed", f"The update was not installed, and your current version still works.\n\nWhat to do: check your internet connection and try again later.\n\nDetails: {exc}")
+            return
+        self.ui(self.status_var.set, f"Step 4 of 4: Restarting as version {release['version']}…")
+        self.ui(restart_app)
+
+    def _show_rollback_notice(self):
+        try:
+            bad, old = ROLLBACK_NOTICE_PATH.read_text(encoding="utf-8").split()[:2]
+            ROLLBACK_NOTICE_PATH.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            return
+        messagebox.showwarning("Update rolled back", f"Version {bad} did not start properly, so Folder Share went back to version {old}.\n\nYour settings are unchanged. Details were saved to the log:\n{LOG_PATH}")
+
+    def remove_launcher(self):
+        if messagebox.askyesno("Remove command", f"Remove the '{LAUNCH_COMMAND}' command and the lines it added to your shell startup files?"):
+            uninstall_sharer_command()
+            messagebox.showinfo("Removed", "The command was removed. Folder Share still runs with: python3 sharer.py")
+
+    def toggle_password(self):
+        showing = self.password_entry.cget("show") == ""
+        self.password_entry.config(show="•" if showing else "")
+        self.show_password_button.config(text="Show" if showing else "Hide")
+
+    def generate_password(self):
+        alphabet = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+        self.password_var.set("-".join("".join(secrets.choice(alphabet) for _ in range(5)) for _ in range(4)))
+        self.password_entry.config(show="")
+        self.show_password_button.config(text="Hide")
+
+    def _copy(self, text: str, done: str):
+        self.window.clipboard_clear()
+        self.window.clipboard_append(text)
+        self.status_var.set(done)
+
+    def copy_password(self):
+        if self.password_var.get():
+            self._copy(self.password_var.get(), "Password copied.")
+
+    def _share_link(self) -> str:
+        link = self.public_url or self.url_var.get()
+        return link if link.startswith("http") else ""
+
+    def copy_link(self):
+        if self._share_link():
+            self._copy(self._share_link(), "Link copied.")
+        else:
+            self.status_var.set("Start sharing first; the link will appear here.")
+
+    def copy_message(self):
+        if self._share_link() and self.password:
+            self._copy(f"Open this link: {self._share_link()} and use this password: {self.password}", "Message copied. Send it only to someone you trust.")
+        else:
+            self.status_var.set("Start sharing first; then you can copy a ready-to-send message.")
 
     def _show_version_notice(self):
         notice = tk.Toplevel(self.window)
@@ -1294,33 +1735,21 @@ class App:
         notice.protocol("WM_DELETE_WINDOW", close_notice)
 
     def _show_command_notice(self):
+        """Ask first: adding the command edits shell startup files / the Windows PATH."""
         if self.command_notice_shown:
             return
         self.command_notice_shown = True
-        notice = tk.Toplevel(self.window)
-        notice.title("Folder Share command ready")
-        notice.transient(self.window)
-        notice.grab_set()
-        frame = ttk.Frame(notice, padding=22)
-        frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="Quick launch is ready", font=("TkDefaultFont", 15, "bold")).pack(anchor="w")
-        ttk.Label(frame, text="You can now open Folder Share without typing the full file path. Open a new terminal, then type:", wraplength=480, justify="left").pack(anchor="w", pady=(12, 8))
-        ttk.Label(frame, text=LAUNCH_COMMAND, font=("TkFixedFont", 14, "bold")).pack(anchor="w", pady=(0, 8))
-        ttk.Label(frame, text=f"This works in a new Command Prompt or PowerShell window on Windows, and in a new Terminal window on macOS or Linux. Existing terminals do not always reload PATH settings.", wraplength=480, justify="left").pack(anchor="w")
-        ttk.Label(frame, text=f"Launcher location:\n{self.command_path}", wraplength=480, justify="left", foreground="#65758b").pack(anchor="w", pady=(8, 0))
-        hide = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frame, text="Don’t show this notification again", variable=hide).pack(anchor="w", pady=(14, 0))
-        def close_notice():
-            if hide.get():
-                token = f"{APP_VERSION}|{Path(__file__).resolve()}"
-                COMMAND_NOTICE_DISMISSED_PATH.write_text(token + "\n", encoding="utf-8")
-            notice.grab_release()
-            notice.destroy()
-        actions = ttk.Frame(frame)
-        actions.pack(anchor="e", pady=(18, 0))
-        ttk.Button(actions, text="Open Folder Share now", command=close_notice).pack(side="left", padx=(0, 8))
-        ttk.Button(actions, text="OK", command=close_notice).pack(side="left")
-        notice.protocol("WM_DELETE_WINDOW", close_notice)
+        agreed = messagebox.askyesno("Add a quick-launch command?", f"Folder Share can add a '{LAUNCH_COMMAND}' command, so you can start it by typing '{LAUNCH_COMMAND}' in a terminal.\n\nThis creates a small launcher file and adds its folder to your PATH (on macOS/Linux it edits your shell startup files; on Windows it changes your user PATH). You can remove it later from this window.\n\nAdd the command?", default="no")
+        try:
+            COMMAND_NOTICE_DISMISSED_PATH.write_text(str(Path(__file__).resolve()) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+        if agreed:
+            try:
+                self.command_path = install_sharer_command()
+                messagebox.showinfo("Quick launch ready", f"Open a new terminal and type: {LAUNCH_COMMAND}\n\nLauncher: {self.command_path}")
+            except OSError as exc:
+                messagebox.showerror("Could not add the command", f"The command could not be added.\n\nDetails: {exc}")
 
     def choose_folder(self):
         chosen = filedialog.askdirectory(title="Choose the folder to share")
@@ -1407,10 +1836,10 @@ class App:
 
     def _prepare_public_start(self):
         try:
-            path = ensure_cloudflared(lambda text, fraction: self.window.after(0, self.status_var.set, text))
-            self.window.after(0, lambda: self._start_server(path))
+            path = ensure_cloudflared(lambda text, fraction: self.ui(self.status_var.set, text))
+            self.ui(lambda: self._start_server(path))
         except (OSError, urllib.error.URLError, RuntimeError, json.JSONDecodeError, tarfile.TarError) as exc:
-            self.window.after(0, lambda: self._setup_failed(str(exc)))
+            self.ui(lambda: self._setup_failed(str(exc)))
 
     def _setup_failed(self, details: str):
         self.progress.stop()
@@ -1425,7 +1854,8 @@ class App:
         state = ShareState(self.folder, self.password)
         self.share_state = state
         try:
-            self.server = ReusableServer(("0.0.0.0", 0), FolderHandler)
+            self.bind_host = "0.0.0.0" if (not self.public_var.get() or self.lan_var.get()) else "127.0.0.1"
+            self.server = ReusableServer((self.bind_host, 0), FolderHandler)
             self.server.share_state = state  # type: ignore[attr-defined]
             self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
             self.thread.start()
@@ -1435,7 +1865,11 @@ class App:
             return
         port = self.server.server_address[1]
         lan_url = f"http://{local_ip()}:{port}/"
-        self.local_url_var.set("Same Wi‑Fi: " + lan_url)
+        lan_enabled = self.bind_host == "0.0.0.0"
+        self.server_port = port
+        self.cloudflared_path = cloudflared_path
+        self.tunnel_retry_count = 0
+        self.local_url_var.set(("Same Wi‑Fi: " + lan_url) if lan_enabled else "")
         if self.public_var.get() and cloudflared_path:
             self.url_var.set("Starting encrypted internet link…")
             self.password_label.config(text="Password is set and will not be displayed here.")
@@ -1451,6 +1885,7 @@ class App:
         self.refresh_devices()
 
     def stop(self):
+        self.tunnel_generation += 1  # cancels pending reconnects and timeouts
         if self.tunnel_process:
             try:
                 self.tunnel_process.terminate()
@@ -1482,6 +1917,8 @@ class App:
         self.choose_button.config(state="normal")
         self.start_button.config(state="normal" if self.folder else "disabled")
         self.stop_button.config(state="disabled")
+        if self.pending_release:
+            self._show_update_banner(self.pending_release)
 
     def close(self):
         self.stop()
@@ -1489,18 +1926,23 @@ class App:
 
     def show_qr(self):
         if not self.public_url:
-            messagebox.showinfo("QR code not ready", "Start sharing and wait until the public HTTPS link appears.")
+            messagebox.showinfo("QR code not ready", "Start sharing and wait until the internet link appears.")
             return
+        include = bool(self.qr_password_var.get())
+        if include and not messagebox.askyesno("Include the password?", "Anyone who scans this QR code gets the link AND the password.\n\nOnly continue if you are showing it in person to someone you trust.", default="no"):
+            return
+        self._qr_has_password = include
         self.qr_button.config(state="disabled")
-        self.status_var.set("Preparing the QR code… the window will remain usable.")
-        threading.Thread(target=self._qr_worker, daemon=True).start()
+        self.status_var.set("Preparing the QR code…")
+        threading.Thread(target=self._qr_worker, args=(include, self.public_url, self.password), daemon=True).start()
 
-    def _qr_worker(self):
+    def _qr_worker(self, include_password: bool, url: str, password: str):
         try:
-            image_path = make_qr_image(f"Folder Share\nURL: {self.public_url}\nPassword: {self.password}", CLOUDFLARED_DIR / "folder-share-qr.png", lambda text: self.window.after(0, self.status_var.set, text))
-            self.window.after(0, lambda: self._display_qr(image_path))
+            payload = f"{url}\nPassword: {password}" if include_password else url
+            image_path = make_qr_image(payload, CLOUDFLARED_DIR / "folder-share-qr.png")
+            self.ui(self._display_qr, image_path)
         except Exception as exc:
-            self.window.after(0, lambda: self._qr_failed(str(exc)))
+            self.ui(self._qr_failed, str(exc))
 
     def _qr_failed(self, details: str):
         self.qr_button.config(state="normal")
@@ -1518,13 +1960,19 @@ class App:
         qr_window = tk.Toplevel(self.window)
         qr_window.title("Scan to receive sharing details")
         qr_window.transient(self.window)
-        ttk.Label(qr_window, text="Scan this only with someone you trust.\nIt contains the URL and password.").pack(padx=18, pady=(18, 8))
+        ttk.Label(qr_window, text=("Scan this only with someone you trust.\nIt contains the link and the password." if getattr(self, "_qr_has_password", False) else "Scan this to open the link.\nThe password is not included.")).pack(padx=18, pady=(18, 8))
         label = ttk.Label(qr_window, image=image)
         label.image = image
         label.pack(padx=18, pady=8)
         ttk.Label(qr_window, text=self.public_url, wraplength=420).pack(padx=18, pady=(0, 18))
 
     def _start_tunnel(self, port: int, cloudflared_path: str | None):
+        self.tunnel_generation += 1
+        generation = self.tunnel_generation
+        self.public_url = ""
+        old = self.tunnel_process
+        if old and old.poll() is None:
+            old.terminate()
         try:
             tunnel_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "text": True, "bufsize": 1}
             if os.name == "nt":
@@ -1532,40 +1980,76 @@ class App:
             self.tunnel_process = subprocess.Popen([cloudflared_path or "cloudflared", "tunnel", "--url", f"http://127.0.0.1:{port}", "--no-autoupdate"], **tunnel_kwargs)
         except OSError as exc:
             self.stop()
-            messagebox.showerror("Could not start secure link", str(exc))
+            messagebox.showerror("Could not start the internet link", "Folder Share could not start its secure internet component.\n\nWhat to do: antivirus or firewall software often blocks it. See the README troubleshooting section, or turn off the internet link to share on the same Wi-Fi only.\n\nDetails: " + str(exc))
             return
-        threading.Thread(target=self._read_tunnel_output, daemon=True).start()
+        threading.Thread(target=self._read_tunnel_output, args=(self.tunnel_process,), daemon=True).start()
+        self.window.after(30000, self._tunnel_timeout, generation)
 
-    def _read_tunnel_output(self):
-        process = self.tunnel_process
-        if not process or not process.stdout:
-            return
-        for line in process.stdout:
-            # cloudflared prints a Cloudflare terms URL before the actual
-            # tunnel URL. Only accept the generated Quick Tunnel hostname.
-            match = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com(?:/[^\s]*)?", line)
-            if match:
-                url = match.group(0).rstrip(".,)") + "/"
-                self.window.after(0, lambda value=url: self._tunnel_ready(value))
-                return
-        self.window.after(0, self._tunnel_failed)
+    def _read_tunnel_output(self, process):
+        announced = False
+        try:
+            for line in process.stdout:  # keep draining for the whole life of the process so its pipe never fills up
+                if not announced:
+                    # cloudflared prints a Cloudflare terms URL before the real
+                    # tunnel URL. Only accept the generated Quick Tunnel hostname.
+                    match = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com(?:/[^\s]*)?", line)
+                    if match:
+                        announced = True
+                        self.ui(self._tunnel_ready, process, match.group(0).rstrip(".,)") + "/")
+        except (OSError, ValueError):
+            pass
+        self.ui(self._tunnel_ended, process, announced)
 
-    def _tunnel_ready(self, url: str):
-        if self.server:
+    def _tunnel_ready(self, process, url: str):
+        if self.server and process is self.tunnel_process:
+            reconnected = self.tunnel_retry_count > 0
+            self.tunnel_retry_count = 0
             self.public_url = url
             self.url_var.set(url)
             self.qr_button.config(state="normal")
-            self.status_var.set("Encrypted internet sharing is active. Give the URL and your chosen password to someone you trust.")
+            self.status_var.set(("Reconnected. The link has changed, so send the new one. " if reconnected else "") + "Encrypted internet sharing is active. Give the link and your password to someone you trust.")
 
-    def _tunnel_failed(self):
+    def _tunnel_ended(self, process, announced: bool):
+        if not self.server or process is not self.tunnel_process:
+            return  # stopped on purpose, or already replaced
+        if announced:
+            self._tunnel_lost()
+        else:
+            self._tunnel_failed()
+
+    def _tunnel_lost(self):
+        self.public_url = ""
+        self.qr_button.config(state="disabled")
+        if self.tunnel_retry_count >= 3:
+            self.url_var.set("⚠ Link lost")
+            self.status_var.set("The internet link was lost and could not be restored. Press Stop sharing, then Start again to get a new link.")
+            return
+        delay = (2, 5, 10)[self.tunnel_retry_count]
+        self.tunnel_retry_count += 1
+        self.url_var.set("⚠ Link lost. Reconnecting…")
+        self.status_var.set(f"Reconnecting (try {self.tunnel_retry_count} of 3). The link may change.")
+        self.window.after(delay * 1000, self._reconnect_tunnel, self.tunnel_generation)
+
+    def _reconnect_tunnel(self, generation: int):
+        if self.server and generation == self.tunnel_generation:
+            self._start_tunnel(self.server_port, self.cloudflared_path)
+
+    def _tunnel_timeout(self, generation: int):
+        if self.server and generation == self.tunnel_generation and not self.public_url and self.tunnel_process:
+            self._tunnel_failed(timed_out=True)
+
+    def _tunnel_failed(self, timed_out: bool = False):
         if self.server:
+            reason = "took longer than 30 seconds to start" if timed_out else "could not be created"
             self.status_var.set("The secure internet link could not be created. Sharing was stopped.")
             self.stop()
-            messagebox.showerror("Tunnel failed", "cloudflared could not create an internet link. Check your internet connection and try again.")
+            messagebox.showerror("Internet link failed", f"The internet link {reason}.\n\nWhat to do: check your internet connection, then press Start again. If it keeps failing, antivirus or firewall software may be blocking the secure component (see the README troubleshooting), or you can turn off the internet link and share on the same Wi-Fi only.")
 
 
 if __name__ == "__main__":
     detach_from_terminal()
+    if startup_update_guard():
+        restart_app()  # the new version failed to start, so the previous one was restored
     if tk is None:
         print("The graphical interface needs Python Tkinter, but it is not installed.")
         print("Ubuntu/Debian: sudo apt install python3-tk")

@@ -1,22 +1,17 @@
 #!/usr/bin/env bash
+# One-command release. Usage: ./release.sh 2.6.0
+# Write the notes under "## [Unreleased]" in CHANGELOG.md first.
 set -euo pipefail
 version="${1:-}"
-if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  echo "Usage: ./release.sh 2.5.1" >&2
-  exit 2
-fi
-python3 - "$version" <<'PY'
-from pathlib import Path
-import re, sys
-version=sys.argv[1]
-p=Path('sharer.py'); s=p.read_text(); s2=re.sub(r'(?m)^APP_VERSION\s*=\s*["\'][^"\']+["\']', f'APP_VERSION = "{version}"', s, count=1)
-if s2 == s: raise SystemExit('APP_VERSION not found')
-p.write_text(s2)
-PY
-printf '\n## [%s] - %s\n\n### Changed\n\n- Release %s.\n' "$version" "$(date +%F)" "$version" >> CHANGELOG.md
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Usage: ./release.sh 2.6.0" >&2; exit 2; }
+[[ "$(git rev-parse --abbrev-ref HEAD)" == "main" ]] || { echo "Switch to the main branch first." >&2; exit 1; }
+[[ -z "$(git status --porcelain)" ]] || { echo "Commit or stash your changes first." >&2; exit 1; }
+git pull --ff-only
+python3 tools/bump_release.py "$version"
 python3 -m py_compile sharer.py
-python3 -m unittest discover -s tests -v
-git add .
+python3 -m unittest discover -s tests
+git add sharer.py CHANGELOG.md
 git commit -m "Release v$version"
-git tag "v$version"
-git push origin main --tags
+git tag -a "v$version" -m "v$version"   # use -s instead of -a if you have signing set up
+git push origin main "v$version"
+echo "Pushed v$version. GitHub Actions will publish the release; apps check for it every 6 hours."
