@@ -7,10 +7,14 @@ app show a stronger "please update" message (those lines are hidden from the not
 
 ## [Unreleased]
 
+### Fixed
+- Added comfortable spacing between the QR and copy buttons.
+
 ## [2.6.3] - 2026-11-19
 
 ### Fixed
 - Keep the Include password in QR code option visible in the default window.
+- Keep Show QR code for a friend visible beside the copy buttons.
 
 ## [2.6.2] - 2026-11-19
 
