@@ -7,6 +7,8 @@ app show a stronger "please update" message (those lines are hidden from the not
 
 ## [Unreleased]
 
+## [2.6.4] - 2026-11-19
+
 ### Fixed
 - Added comfortable spacing between the QR and copy buttons.
 
