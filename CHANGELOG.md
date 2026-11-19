@@ -7,6 +7,9 @@ app show a stronger "please update" message (those lines are hidden from the not
 
 ## [Unreleased]
 
+### Fixed
+- Moved the Connected devices button into the visible sharing controls so it is not hidden below the window.
+
 ## [2.6.0] - 2026-11-19
 
 ### Security
