@@ -7,6 +7,9 @@ app show a stronger "please update" message (those lines are hidden from the not
 
 ## [Unreleased]
 
+### Fixed
+- Keep the Include password in QR code option visible in the default window.
+
 ## [2.6.2] - 2026-11-19
 
 ### Fixed
