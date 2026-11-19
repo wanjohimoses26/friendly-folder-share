@@ -7,6 +7,8 @@ app show a stronger "please update" message (those lines are hidden from the not
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-11-19
+
 ### Security
 - File names can no longer inject script into the web page.
 - Wrong-password limits now work behind the internet link (they used to share one bucket for everyone) and slow down with each failure.
