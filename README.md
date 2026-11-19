@@ -1,29 +1,44 @@
 # Friendly Folder Share
 
-Friendly Folder Share is a single-file Python application that lets an owner share one selected folder over the same Wi‑Fi or through a temporary secure internet link. People sign in with the owner-provided password, choose a nickname, and can manage only the shared folder.
+Share one folder from your computer with friends: they open a link, type a password, and can download, upload, rename and delete files in that folder only. One file (`sharer.py`), nothing to install except Python.
 
-## Run it
+## Install and run
 
-Download [`sharer.py`](sharer.py), then run `python3 sharer.py`. The app can install the per-user `sharer` launcher; after opening a new terminal, run `sharer`.
+1. Install **Python 3.9 or newer** from [python.org](https://www.python.org/downloads/) (Windows: tick "Add Python to PATH"; Linux: `sudo apt install python3 python3-tk`).
+2. Download [`sharer.py`](https://github.com/wanjohimoses26/friendly-folder-share/releases/latest/download/sharer.py).
+3. Run it: **Windows** `python sharer.py` · **macOS/Linux** `python3 sharer.py`.
 
-The owner controls connected devices from the desktop Folder Share window. Connected web users do not receive the owner panel.
+_Screenshot placeholders: `docs/main-window.png`, `docs/web-page.png`._
+
+## Sharing
+
+1. Choose a folder, then type a password (12+ characters) or press **Generate**.
+2. Press **Start secure sharing**. Keep the window open; closing it stops sharing.
+3. Press **Copy message for a friend** and send it. The internet link changes every time you start sharing.
+
+## FAQ
+
+- **Is it safe?** Only the chosen folder is reachable, behind a password, over HTTPS. Share only folders you are happy to expose.
+- **Does it cost anything or send data to the author?** No. There is no telemetry.
+- **Same Wi-Fi only?** Untick the internet link and tick the same-Wi-Fi option. Same-Wi-Fi access is not encrypted.
+- **Why does the link change?** It uses a free Cloudflare Quick Tunnel: fine for casual sharing, no uptime guarantee.
 
 ## How updates work
 
-Stable updates are published as GitHub Releases. The app must use release assets, not the mutable `main` branch. Updates are checked over HTTPS, verified against the published SHA-256 file, compiled before installation, backed up, and installed atomically. The `sharer` command remains the same.
-
-People using an older copy need to download the latest `sharer.py` once. After that, the built-in updater can manage later releases.
-
-## Security
-
-Share only a folder you are comfortable exposing. Use a unique strong password. Quick Tunnel links are temporary and can change each time sharing starts. Never commit passwords, session tokens, private keys, or personal files.
-
-Anyone who controls this repository can publish code that users may run through the updater. Protect the GitHub account with 2FA, protect the `main` branch, review workflows, and use signed tags where possible. This application sends no telemetry.
+Updates come from GitHub Releases only. The app checks at start and every 6 hours, downloads `sharer.py` and its `.sha256`, verifies the checksum, that it is valid Python and the right version, backs up the old file (last 3 kept in `~/.friendly_folder_share/backups`), and installs it atomically. If a new version fails to start, the previous one is restored automatically. Updates are never installed while you are sharing. Copies older than 2.5.1 have no updater: download the latest `sharer.py` once, and updates are automatic after that.
 
 ## Troubleshooting
 
-If `sharer` is unknown, open a new terminal after the launcher is installed. The desktop notification shows the exact launcher path. You can always run `python3 sharer.py` directly.
+- **`sharer` command not found:** open a new terminal, or run `python3 sharer.py` directly.
+- **Internet link will not start:** antivirus or a firewall may block the `cloudflared` component in `~/.friendly_folder_share`; allow it, or use same-Wi-Fi sharing.
+- **Log file:** `~/.friendly_folder_share/folder_share.log`.
+
+## For the owner: releasing
+
+Write notes under `## [Unreleased]` in `CHANGELOG.md`, then run `./release.sh 2.6.0` (Windows: `release.bat 2.6.0`). It bumps `APP_VERSION`, runs the tests, commits, tags and pushes; GitHub Actions tests on Python 3.9 and 3.12 and publishes the release. Put `min_version: X.Y.Z` or `critical: true` on its own line in the notes to force a stronger update prompt.
+
+**Anyone who controls this repository controls what runs on every user's computer.** Turn on 2FA, protect `main` (no force-push or deletion), sign tags if you can, review workflow changes, and never commit passwords or tokens.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).

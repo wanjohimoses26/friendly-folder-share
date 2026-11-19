@@ -8,35 +8,47 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m py_compile sharer.py
+      - run: python -m unittest discover -s tests -v
+
   release:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Check tag matches APP_VERSION
-        shell: bash
+      - name: Check tag matches APP_VERSION and the changelog has notes
         run: |
           python - <<'PY'
           import os, re
           from pathlib import Path
           tag = os.environ['GITHUB_REF_NAME']
-          source = Path('sharer.py').read_text()
-          match = re.search(r'^APP_VERSION\s*=\s*["\']([^"\']+)', source, re.M)
+          match = re.search(r'^APP_VERSION\s*=\s*["\']([^"\']+)', Path('sharer.py').read_text(), re.M)
           assert match, 'APP_VERSION not found'
           assert tag == 'v' + match.group(1), (tag, match.group(1))
+          log = Path('CHANGELOG.md').read_text(encoding='utf-8')
+          section = re.search(r'(?ms)^## \[' + re.escape(tag[1:]) + r'\][^\n]*\n(.*?)(?=^## \[|\Z)', log)
+          assert section and section.group(1).strip(), 'CHANGELOG.md has no notes for ' + tag
+          Path('release_notes.md').write_text(section.group(1).strip() + '\n', encoding='utf-8')
           PY
-      - name: Compile
-        run: python -m py_compile sharer.py
-      - name: Run tests
-        run: python -m unittest discover -s tests -v
       - name: Create checksum
         run: sha256sum sharer.py > sharer.py.sha256
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body_path: release_notes.md
           files: |
             sharer.py
             sharer.py.sha256
