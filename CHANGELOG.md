@@ -7,6 +7,8 @@ app show a stronger "please update" message (those lines are hidden from the not
 
 ## [Unreleased]
 
+## [2.6.2] - 2026-11-19
+
 ### Fixed
 - Kept Connected devices beside Start secure sharing so the QR and copy controls remain visible.
 - Moved Copy link and Copy message above the QR controls so they remain visible on shorter screens.
